@@ -918,15 +918,30 @@ public:
             cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
 
         /*** ROS subscribe initialization ***/
+        // Callback Group
+        imu_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        pcl_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        pcl_livoxcallback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+
+        rclcpp::SubscriptionOptions pcl_options;
+            pcl_options.callback_group = pcl_callback_group_;
+        rclcpp::SubscriptionOptions pcl_livox_options;
+            pcl_livox_options.callback_group = pcl_livoxcallback_group_;
+        rclcpp::SubscriptionOptions imu_options;
+            imu_options.callback_group = imu_callback_group_;
+
+
         if (p_pre->lidar_type == AVIA)
         {
-            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);
+            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk, pcl_livox_options);
         }
         else
         {
-            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
+            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk, pcl_options);
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+
+        
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>("/mid360/imu", 10, imu_cbk, imu_options);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
@@ -1138,6 +1153,11 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
+
+    // Callback Group
+    rclcpp::CallbackGroup::SharedPtr imu_callback_group_;
+    rclcpp::CallbackGroup::SharedPtr pcl_callback_group_;
+    rclcpp::CallbackGroup::SharedPtr pcl_livoxcallback_group_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;
