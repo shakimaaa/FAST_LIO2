@@ -282,6 +282,7 @@ void lasermap_fov_segment()
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
+    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "Standard PCL callback");
     mtx_buffer.lock();
     scan_count ++;
     double cur_time = get_time_sec(msg->header.stamp);
@@ -349,6 +350,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 {
+    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "IMU callback");
     publish_count ++;
     // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
@@ -871,6 +873,8 @@ public:
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
+        RCLCPP_INFO(this->get_logger(), "imu_topic %s", imu_topic.c_str());
+        RCLCPP_INFO(this->get_logger(), "lid_topic %s", lid_topic.c_str());
 
         path.header.stamp = this->get_clock()->now();
         path.header.frame_id ="camera_init";
@@ -922,6 +926,7 @@ public:
         imu_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         pcl_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         pcl_livoxcallback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        timer_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
         rclcpp::SubscriptionOptions pcl_options;
             pcl_options.callback_group = pcl_callback_group_;
@@ -929,6 +934,8 @@ public:
             pcl_livox_options.callback_group = pcl_livoxcallback_group_;
         rclcpp::SubscriptionOptions imu_options;
             imu_options.callback_group = imu_callback_group_;
+        // rclcpp::SubscriptionOptions timer_options;
+        //     timer_options.callback_group = timer_callback_group_;
 
 
         if (p_pre->lidar_type == AVIA)
@@ -941,7 +948,7 @@ public:
         }
 
         
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>("/mid360/imu", 10, imu_cbk, imu_options);
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk, imu_options);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
@@ -952,7 +959,7 @@ public:
 
         //------------------------------------------------------------------------------------------------------
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
-        timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
+        timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this), timer_callback_group_);
 
         auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0));
         map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
@@ -1158,6 +1165,7 @@ private:
     rclcpp::CallbackGroup::SharedPtr imu_callback_group_;
     rclcpp::CallbackGroup::SharedPtr pcl_callback_group_;
     rclcpp::CallbackGroup::SharedPtr pcl_livoxcallback_group_;
+    rclcpp::CallbackGroup::SharedPtr timer_callback_group_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;
@@ -1181,6 +1189,12 @@ int main(int argc, char** argv)
     signal(SIGINT, SigHandle);
 
     rclcpp::spin(std::make_shared<LaserMappingNode>());
+
+    // // 启用多线程执行器
+    // rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 4);
+    // auto node = std::make_shared<LaserMappingNode>();
+    // executor.add_node(node);
+    // executor.spin();
 
     if (rclcpp::ok())
         rclcpp::shutdown();
