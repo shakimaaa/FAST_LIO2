@@ -16,8 +16,9 @@ enum LID_TYPE
   AVIA = 1,
   VELO16,
   OUST64,
-  MID360
-};  //{1, 2, 3}
+  MID360,
+  AIRY
+};  //{1, 2, 3, 4, 5}
 enum TIME_UNIT
 {
   SEC = 0,

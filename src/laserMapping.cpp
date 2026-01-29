@@ -282,7 +282,7 @@ void lasermap_fov_segment()
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
-    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "Standard PCL callback");
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "Standard PCL callback");
     mtx_buffer.lock();
     scan_count ++;
     double cur_time = get_time_sec(msg->header.stamp);
