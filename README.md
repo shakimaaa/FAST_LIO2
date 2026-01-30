@@ -1,6 +1,6 @@
 # FAST-LIO2 
 
-**Disclaimer:** This fork is adapted for the **Airy** LiDAR. Coordinate system transformations have been adjusted for Airy's hardware mounting, while retaining a modular design so that different LiDARs can be supported via configuration.
+**Disclaimer:** This fork is adapted for the **Airy** LiDAR. Coordinate system transformations have been adjusted for Airy's hardware mounting, while retaining a modular design so that different LiDARs can be supported via configuration. After cloning, run `git submodule update --init` to fetch submodules.
 
 **[中文说明](README_cn.md)**
 
