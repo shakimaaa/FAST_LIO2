@@ -133,6 +133,24 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzrtl,
     (uint8_t, line, line)
 )
 
+// rslidar_sdk / Airy: PointXYZIRT (x,y,z,intensity,ring,timestamp in seconds), layout matches ROS PointCloud2
+namespace airy_ros
+{
+struct EIGEN_ALIGN16 Point
+{
+  float x;
+  float y;
+  float z;
+  float intensity;
+  uint16_t ring;
+  double timestamp;
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+};
+}  // namespace airy_ros
+POINT_CLOUD_REGISTER_POINT_STRUCT(airy_ros::Point,
+    (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)
+    (uint16_t, ring, ring)(double, timestamp, timestamp))
+
 class Preprocess
 {
   public:
@@ -160,6 +178,7 @@ private:
   void oust64_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
   void velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
   void mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
+  void airy_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
   void default_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
   void give_feature(PointCloudXYZI &pl, vector<orgtype> &types);
   void pub_func(PointCloudXYZI &pl, const rclcpp::Time &ct);

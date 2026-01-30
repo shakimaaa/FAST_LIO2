@@ -85,6 +85,10 @@ void Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, Po
       mid360_handler(msg);
       break;
 
+    case AIRY:
+      airy_handler(msg);
+      break;
+
     default:
       default_handler(msg);
       break;
@@ -552,6 +556,60 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
     if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
     {
       pl_surf.push_back(std::move(added_pt));
+    }
+  }
+}
+
+void Preprocess::airy_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg)
+{
+  pl_surf.clear();
+  pl_corn.clear();
+  pl_full.clear();
+
+  bool has_timestamp = false;
+  for (const auto & field : msg->fields)
+  {
+    if (field.name == "timestamp")
+    {
+      has_timestamp = true;
+      break;
+    }
+  }
+
+  if (!has_timestamp)
+  {
+    default_handler(msg);
+    return;
+  }
+
+  pcl::PointCloud<airy_ros::Point> pl_orig;
+  pcl::fromROSMsg(*msg, pl_orig);
+  int plsize = pl_orig.points.size();
+  if (plsize == 0)
+    return;
+  pl_surf.reserve(plsize);
+
+  given_offset_time = true;
+  double first_ts = pl_orig.points[0].timestamp;
+
+  for (int i = 0; i < plsize; i++)
+  {
+    PointType added_pt;
+    added_pt.normal_x = 0;
+    added_pt.normal_y = 0;
+    added_pt.normal_z = 0;
+    added_pt.x = pl_orig.points[i].x;
+    added_pt.y = pl_orig.points[i].y;
+    added_pt.z = pl_orig.points[i].z;
+    added_pt.intensity = pl_orig.points[i].intensity;
+    added_pt.curvature = (pl_orig.points[i].timestamp - first_ts) * 1000.0;
+
+    if (i % point_filter_num == 0)
+    {
+      if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
+      {
+        pl_surf.points.push_back(added_pt);
+      }
     }
   }
 }

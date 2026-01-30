@@ -282,7 +282,7 @@ void lasermap_fov_segment()
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
-    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "Standard PCL callback");
+    RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping"), "Standard PCL callback");
     mtx_buffer.lock();
     scan_count ++;
     double cur_time = get_time_sec(msg->header.stamp);
@@ -299,6 +299,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr);
+    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "here is ok");
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(cur_time);
     last_timestamp_lidar = cur_time;
@@ -350,7 +351,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 {
-    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "IMU callback");
+    RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping"), "IMU callback");
     publish_count ++;
     // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
@@ -384,6 +385,7 @@ double lidar_mean_scantime = 0.0;
 int    scan_num = 0;
 bool sync_packages(MeasureGroup &meas)
 {
+    RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping"), "sync_packages");
     if (lidar_buffer.empty() || imu_buffer.empty()) {
         return false;
     }
@@ -395,18 +397,29 @@ bool sync_packages(MeasureGroup &meas)
         meas.lidar_beg_time = time_buffer.front();
         if (meas.lidar->points.size() <= 1) // time too little
         {
-            lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
+            double default_scan_time = (p_pre->SCAN_RATE > 0) ? (1.0 / p_pre->SCAN_RATE) : 0.1;
+            lidar_end_time = meas.lidar_beg_time + (lidar_mean_scantime > 1e-6 ? lidar_mean_scantime : default_scan_time);
             std::cerr << "Too few input point cloud!\n";
         }
         else if (meas.lidar->points.back().curvature / double(1000) < 0.5 * lidar_mean_scantime)
         {
-            lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
+            double default_scan_time = (p_pre->SCAN_RATE > 0) ? (1.0 / p_pre->SCAN_RATE) : 0.1;
+            lidar_end_time = meas.lidar_beg_time + (lidar_mean_scantime > 1e-6 ? lidar_mean_scantime : default_scan_time);
         }
         else
         {
-            scan_num ++;
-            lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / double(1000);
-            lidar_mean_scantime += (meas.lidar->points.back().curvature / double(1000) - lidar_mean_scantime) / scan_num;
+            double pt_curv = meas.lidar->points.back().curvature / double(1000);
+            if (pt_curv < 1e-6)
+            {
+                double default_scan_time = (p_pre->SCAN_RATE > 0) ? (1.0 / p_pre->SCAN_RATE) : 0.1;
+                lidar_end_time = meas.lidar_beg_time + (lidar_mean_scantime > 1e-6 ? lidar_mean_scantime : default_scan_time);
+            }
+            else
+            {
+                scan_num ++;
+                lidar_end_time = meas.lidar_beg_time + pt_curv;
+                lidar_mean_scantime += (pt_curv - lidar_mean_scantime) / scan_num;
+            }
         }
 
         meas.lidar_end_time = lidar_end_time;
@@ -416,6 +429,10 @@ bool sync_packages(MeasureGroup &meas)
 
     if (last_timestamp_imu < lidar_end_time)
     {
+        static int sync_wait_log_count = 0;
+        if (++sync_wait_log_count <= 5)
+            RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                "sync wait: last_imu=%.3f lidar_end=%.3f (need more IMU after scan end)", last_timestamp_imu, lidar_end_time);
         return false;
     }
 
@@ -979,6 +996,7 @@ public:
 private:
     void timer_callback()
     {
+        RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping"), "timer_callback");
         if(sync_packages(Measures))
         {
             if (flg_first_scan)
@@ -986,6 +1004,7 @@ private:
                 first_lidar_time = Measures.lidar_beg_time;
                 p_imu->first_lidar_time = first_lidar_time;
                 flg_first_scan = false;
+                RCLCPP_INFO(this->get_logger(), "This is first scan, first_lidar_time %f", first_lidar_time);
                 return;
             }
 
