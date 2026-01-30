@@ -397,29 +397,18 @@ bool sync_packages(MeasureGroup &meas)
         meas.lidar_beg_time = time_buffer.front();
         if (meas.lidar->points.size() <= 1) // time too little
         {
-            double default_scan_time = (p_pre->SCAN_RATE > 0) ? (1.0 / p_pre->SCAN_RATE) : 0.1;
-            lidar_end_time = meas.lidar_beg_time + (lidar_mean_scantime > 1e-6 ? lidar_mean_scantime : default_scan_time);
+            lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
             std::cerr << "Too few input point cloud!\n";
         }
         else if (meas.lidar->points.back().curvature / double(1000) < 0.5 * lidar_mean_scantime)
         {
-            double default_scan_time = (p_pre->SCAN_RATE > 0) ? (1.0 / p_pre->SCAN_RATE) : 0.1;
-            lidar_end_time = meas.lidar_beg_time + (lidar_mean_scantime > 1e-6 ? lidar_mean_scantime : default_scan_time);
+            lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
         }
         else
         {
-            double pt_curv = meas.lidar->points.back().curvature / double(1000);
-            if (pt_curv < 1e-6)
-            {
-                double default_scan_time = (p_pre->SCAN_RATE > 0) ? (1.0 / p_pre->SCAN_RATE) : 0.1;
-                lidar_end_time = meas.lidar_beg_time + (lidar_mean_scantime > 1e-6 ? lidar_mean_scantime : default_scan_time);
-            }
-            else
-            {
-                scan_num ++;
-                lidar_end_time = meas.lidar_beg_time + pt_curv;
-                lidar_mean_scantime += (pt_curv - lidar_mean_scantime) / scan_num;
-            }
+            scan_num ++;
+            lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / double(1000);
+            lidar_mean_scantime += (meas.lidar->points.back().curvature / double(1000) - lidar_mean_scantime) / scan_num;
         }
 
         meas.lidar_end_time = lidar_end_time;
@@ -429,10 +418,6 @@ bool sync_packages(MeasureGroup &meas)
 
     if (last_timestamp_imu < lidar_end_time)
     {
-        static int sync_wait_log_count = 0;
-        if (++sync_wait_log_count <= 5)
-            RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
-                "sync wait: last_imu=%.3f lidar_end=%.3f (need more IMU after scan end)", last_timestamp_imu, lidar_end_time);
         return false;
     }
 
@@ -576,7 +561,7 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "body";
+    laserCloudmsg.header.frame_id = (p_pre->lidar_type == AIRY) ? "rslidar" : "body";
     pubLaserCloudFull_body->publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
 }
@@ -675,6 +660,23 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
     trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
     tf_br->sendTransform(trans);
+
+    // 仅 Airy：body -> rslidar，用 Lidar-IMU 外参把 body 下的点云恢复到雷达“正”的坐标系
+    if (p_pre->lidar_type == AIRY)
+    {
+        geometry_msgs::msg::TransformStamped trans_rslidar;
+        trans_rslidar.header.frame_id = "body";
+        trans_rslidar.child_frame_id = "rslidar";
+        trans_rslidar.header.stamp = get_ros_time(lidar_end_time);
+        trans_rslidar.transform.translation.x = state_point.offset_T_L_I(0);
+        trans_rslidar.transform.translation.y = state_point.offset_T_L_I(1);
+        trans_rslidar.transform.translation.z = state_point.offset_T_L_I(2);
+        trans_rslidar.transform.rotation.x = state_point.offset_R_L_I.coeffs()[0];
+        trans_rslidar.transform.rotation.y = state_point.offset_R_L_I.coeffs()[1];
+        trans_rslidar.transform.rotation.z = state_point.offset_R_L_I.coeffs()[2];
+        trans_rslidar.transform.rotation.w = state_point.offset_R_L_I.coeffs()[3];
+        tf_br->sendTransform(trans_rslidar);
+    }
 }
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)

@@ -31,10 +31,16 @@
             fov_degree:    360.0
             det_range:     100.0
             extrinsic_est_en:  true      # true: enable the online estimation of IMU-LiDAR extrinsic
-            extrinsic_T: [ 0.004250, 0.004180, -0.004460 ]
-            extrinsic_R: [ -0.017043, -0.999854, 0.000390,
-                            -0.999835, 0.017041, -0.006199,
-                            0.006192, -0.000495, -0.999980]
+            #  FAST-LIO expects IMU→Lidar (TF: parent=lidar, child=imu). 
+            # extrinsic_T: [ 0.004250, 0.004180, -0.004460 ]
+            # extrinsic_R: [ -0.017043, -0.999854, 0.000390,
+            #                 -0.999835, 0.017041, -0.006199,
+            #                 0.006192, -0.000495, -0.999980]
+            # FAST-LIO expects Lidar→IMU (TF: parent=imu, child=lidar). Converted from your IMU→Lidar.
+            extrinsic_T: [ 0.004279, 0.004176, -0.004436 ]
+            extrinsic_R: [ -0.017043, -0.999835, 0.006192,
+                            -0.999854, 0.017041, -0.000495,
+                            0.000390, -0.006199, -0.999980]
 
         publish:
             path_en: true                # true: publish Path
