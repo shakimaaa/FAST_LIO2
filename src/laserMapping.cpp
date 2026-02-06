@@ -645,6 +645,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.twist.twist.angular.z = 0.0;
     auto P = kf.get_P();
     // 线速度协方差：状态中 vel 在索引 12~14（世界系），变换到 body 系后填入 twist.covariance
+    // 协方差矩阵中 vel 的协方差为 0.0001，即 0.0001 * I
     Eigen::Matrix3d P_vel_world = P.block<3, 3>(12, 12);
     Eigen::Matrix3d R = state_point.rot.toRotationMatrix();
     Eigen::Matrix3d P_vel_body = R.transpose() * P_vel_world * R;
