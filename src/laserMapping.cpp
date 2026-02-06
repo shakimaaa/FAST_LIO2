@@ -635,8 +635,26 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped->publish(odomAftMapped);
+    // 填充线速度：state_point.vel 为世界系，twist 按 REP 103 使用 body 系
+    Eigen::Vector3d vel_body = state_point.rot.toRotationMatrix().transpose() * Eigen::Vector3d(state_point.vel(0), state_point.vel(1), state_point.vel(2));
+    odomAftMapped.twist.twist.linear.x = vel_body(0);
+    odomAftMapped.twist.twist.linear.y = vel_body(1);
+    odomAftMapped.twist.twist.linear.z = vel_body(2);
+    odomAftMapped.twist.twist.angular.x = 0.0;
+    odomAftMapped.twist.twist.angular.y = 0.0;
+    odomAftMapped.twist.twist.angular.z = 0.0;
     auto P = kf.get_P();
+    // 线速度协方差：状态中 vel 在索引 12~14（世界系），变换到 body 系后填入 twist.covariance
+    Eigen::Matrix3d P_vel_world = P.block<3, 3>(12, 12);
+    Eigen::Matrix3d R = state_point.rot.toRotationMatrix();
+    Eigen::Matrix3d P_vel_body = R.transpose() * P_vel_world * R;
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            odomAftMapped.twist.covariance[i * 6 + j] = P_vel_body(i, j);
+    // 角速度未估计，协方差置为 -1 表示未知
+    for (int i = 3; i < 6; i++)
+        odomAftMapped.twist.covariance[i * 6 + i] = -1.0;
+    pubOdomAftMapped->publish(odomAftMapped);
     for (int i = 0; i < 6; i ++)
     {
         int k = i < 3 ? i + 3 : i - 3;
@@ -648,6 +666,19 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
 
+    // 发布camera_init -> base_link TF
+    geometry_msgs::msg::TransformStamped trans_camera_init_base_link;
+    trans_camera_init_base_link.header.frame_id = "base";
+    trans_camera_init_base_link.child_frame_id = "camera_init";
+    trans_camera_init_base_link.header.stamp = get_ros_time(lidar_end_time);
+    trans_camera_init_base_link.transform.translation.x = 0.3;
+    trans_camera_init_base_link.transform.translation.y = 0.0;
+    trans_camera_init_base_link.transform.translation.z = 0.3;
+    trans_camera_init_base_link.transform.rotation.w = 1.0;
+    trans_camera_init_base_link.transform.rotation.x = 0.0;
+    trans_camera_init_base_link.transform.rotation.y = 0.0;
+    trans_camera_init_base_link.transform.rotation.z = 0.0;
+    tf_br->sendTransform(trans_camera_init_base_link);
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = "camera_init";
     trans.child_frame_id = "body";
