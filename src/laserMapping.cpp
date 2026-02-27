@@ -643,6 +643,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.twist.twist.angular.x = 0.0;
     odomAftMapped.twist.twist.angular.y = 0.0;
     odomAftMapped.twist.twist.angular.z = 0.0;
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "vel_body: %f, %f, %f", vel_body(0), vel_body(1), vel_body(2));
     auto P = kf.get_P();
     // 线速度协方差：状态中 vel 在索引 12~14（世界系），变换到 body 系后填入 twist.covariance
     // 协方差矩阵中 vel 的协方差为 0.0001，即 0.0001 * I

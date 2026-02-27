@@ -1,10 +1,11 @@
 /**:
     ros__parameters:
         feature_extract_enable: false
-        point_filter_num: 3
-        max_iteration: 3
-        filter_size_surf: 0.5
-        filter_size_map: 0.5
+        # 顺滑路径/odom：适当增加点云滤波与迭代
+        point_filter_num: 4                     # 3->4 稍多一点降采样，轨迹更稳
+        max_iteration: 4                        # 3->4 每帧收敛更好，减少抖动
+        filter_size_surf: 0.6                   # 0.5->0.6 体素更大，位姿更平滑
+        filter_size_map: 0.6                    # 同上
         cube_side_length: 1000.0
         runtime_pos_log_enable: false
         map_file_path: "./test.pcd"
@@ -24,8 +25,9 @@
             scan_rate: 5
 
         mapping:
-            acc_cov: 0.1
-            gyr_cov: 0.1
+            # 顺滑路径：减小 IMU 过程噪声，更信任 IMU 预测，轨迹更平滑（若过于平滑可适当增大）
+            acc_cov: 0.05                       # 0.1->0.05 更信 IMU，位姿更顺
+            gyr_cov: 0.05                       # 0.1->0.05 同上
             b_acc_cov: 0.0001
             b_gyr_cov: 0.0001
             fov_degree:    360.0
