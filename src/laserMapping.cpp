@@ -561,7 +561,7 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = (p_pre->lidar_type == AIRY) ? "rslidar" : "body";
+    laserCloudmsg.header.frame_id = (p_pre->lidar_type == AIRY) ? "rslidar" : "_body";
     pubLaserCloudFull_body->publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
 }
@@ -632,7 +632,7 @@ void set_posestamp(T & out)
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
 {
     odomAftMapped.header.frame_id = "camera_init";
-    odomAftMapped.child_frame_id = "body";
+    odomAftMapped.child_frame_id = "_body";
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
     // 填充线速度：state_point.vel 为世界系，twist 按 REP 103 使用 body 系
@@ -683,7 +683,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     tf_br->sendTransform(trans_camera_init_base_link);
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = "camera_init";
-    trans.child_frame_id = "body";
+    trans.child_frame_id = "_body";
     trans.header.stamp = get_ros_time(lidar_end_time);
     trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
     trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
@@ -698,7 +698,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     if (p_pre->lidar_type == AIRY)
     {
         geometry_msgs::msg::TransformStamped trans_rslidar;
-        trans_rslidar.header.frame_id = "body";
+        trans_rslidar.header.frame_id = "_body";
         trans_rslidar.child_frame_id = "rslidar";
         trans_rslidar.header.stamp = get_ros_time(lidar_end_time);
         trans_rslidar.transform.translation.x = state_point.offset_T_L_I(0);
@@ -924,6 +924,7 @@ public:
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
 
+        // 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
         RCLCPP_INFO(this->get_logger(), "imu_topic %s", imu_topic.c_str());
         RCLCPP_INFO(this->get_logger(), "lid_topic %s", lid_topic.c_str());

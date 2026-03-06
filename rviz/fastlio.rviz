@@ -86,6 +86,10 @@ Visualization Manager:
           Value: true
         mid360_lidar:
           Value: true
+        odom:
+          Value: true
+        world:
+          Value: true
       Marker Scale: 1
       Name: TF
       Show Arrows: true
@@ -168,8 +172,8 @@ Visualization Manager:
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
-        Max Value: 1.130717158317566
-        Min Value: -0.37998393177986145
+        Max Value: -9999
+        Min Value: -17234422
         Value: true
       Axis: Z
       Channel Name: intensity
@@ -305,10 +309,10 @@ Visualization Manager:
       Autocompute Intensity Bounds: true
       Class: grid_map_rviz_plugin/GridMap
       Color: 200; 200; 200
-      Color Layer: elevation
+      Color Layer: inpaint
       Color Transformer: GridMapLayer
       Enabled: true
-      Height Layer: elevation
+      Height Layer: inpaint
       Height Transformer: GridMapLayer
       History Length: 1
       Invert Rainbow: false
@@ -324,7 +328,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /elevation_mapping/elevation_map_raw
+        Value: /elevation_mapping/filtered_elevation_map
       Use Rainbow: true
       Value: true
   Enabled: true
@@ -373,25 +377,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 17.776905059814453
+      Distance: 58.539730072021484
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: -0.12090377509593964
-        Y: -0.2874697148799896
-        Z: -0.5867919921875
+        X: 0.1639011800289154
+        Y: -0.4023124575614929
+        Z: 0.40397951006889343
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.46979737281799316
+      Pitch: -0.6302019357681274
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz_default_plugins)
-      Yaw: 1.5473181009292603
+      Yaw: 1.372321367263794
     Saved: ~
 Window Geometry:
   Displays:
@@ -410,4 +414,4 @@ Window Geometry:
     collapsed: false
   Width: 1193
   X: 566
-  Y: 328
+  Y: 327

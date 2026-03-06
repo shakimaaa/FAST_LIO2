@@ -1,9 +1,9 @@
 /**:
     ros__parameters:
         feature_extract_enable: false
-        point_filter_num: 3
-        max_iteration: 3
-        filter_size_surf: 0.5
+        point_filter_num: 3                     # 3->4 稍多一点降采样，轨迹更稳
+        max_iteration: 3                        # 3->4 每帧收敛更好，减少抖动
+        filter_size_surf: 0.5                   # 0.5->0.6 体素更大，位姿更平滑
         filter_size_map: 0.5
         cube_side_length: 1000.0
         runtime_pos_log_enable: false
@@ -24,17 +24,32 @@
             scan_rate: 10
 
         mapping:
-            acc_cov: 0.1
-            gyr_cov: 0.1
-            b_acc_cov: 0.0001
-            b_gyr_cov: 0.0001
+            acc_cov: 0.2
+            gyr_cov: 0.2
+            b_acc_cov: 0.0005
+            b_gyr_cov: 0.0005
             fov_degree:    360.0
             det_range:     100.0
-            extrinsic_est_en:  true      # true: enable the online estimation of IMU-LiDAR extrinsic
+            extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
             extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
             extrinsic_R: [ 1., 0., 0.,
                             0., 1., 0.,
                             0., 0., 1.]
+            # extrinsic_R: [ -1., 0., 0.,
+            #                 0., 1., 0.,
+            #                 0., 0., -1.]
+            # 25度
+            # extrinsic_R: [ 0.9063, 0., 0.4226,
+            #                 0., 1., 0.,
+            #                 -0.4226, 0., 0.9063]
+            # 90度
+            # extrinsic_R: [ 0., 0., 1.,
+            #                 0., 1., 0.,
+            #                 -1., 0., 0.]
+            # 110度
+            # extrinsic_R: [ -0.3420, 0., 0.9379,
+            #                 0., 1., 0.,
+            #                 -0.9379, 0., -0.3420]
 
         publish:
             path_en: true                # true: publish Path
