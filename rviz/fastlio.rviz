@@ -68,23 +68,39 @@ Visualization Manager:
           Value: true
         RR_thigh:
           Value: true
+        _body:
+          Value: true
         base:
           Value: true
         base_link:
-          Value: true
-        body:
           Value: true
         camera_init:
           Value: true
         camera_link:
           Value: true
+        d435i_depth_camera_imu_link:
+          Value: true
+        d435i_depth_link:
+          Value: true
+        d435i_infra1_link:
+          Value: true
+        d435i_infra2_link:
+          Value: true
+        fake_base:
+          Value: true
         imu_link:
           Value: true
+        lidar2_link:
+          Value: true
         lidar_link:
+          Value: true
+        mid360_2_imu_link:
           Value: true
         mid360_imu_link:
           Value: true
         mid360_lidar:
+          Value: true
+        mid360_lidar_2:
           Value: true
         odom:
           Value: true
@@ -98,7 +114,7 @@ Visualization Manager:
       Tree:
         base:
           camera_init:
-            body:
+            _body:
               {}
       Update Interval: 0
       Value: true
@@ -172,8 +188,8 @@ Visualization Manager:
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
-        Max Value: -9999
-        Min Value: -17234422
+        Max Value: 9.457761764526367
+        Min Value: -0.917985200881958
         Value: true
       Axis: Z
       Channel Name: intensity
@@ -334,7 +350,7 @@ Visualization Manager:
   Enabled: true
   Global Options:
     Background Color: 0; 0; 0
-    Fixed Frame: camera_init
+    Fixed Frame: base
     Frame Rate: 30
   Name: root
   Tools:
@@ -377,7 +393,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 58.539730072021484
+      Distance: 16.30337142944336
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -392,7 +408,7 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: -0.6302019357681274
+      Pitch: -0.6352019309997559
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz_default_plugins)
       Yaw: 1.372321367263794

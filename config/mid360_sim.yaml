@@ -2,8 +2,8 @@
     ros__parameters:
         feature_extract_enable: false
         # 精细建图：保留更多点、更小体素、更多迭代（仿真可偏激进，实机需权衡算力）
-        point_filter_num: 3                     # 1=保留最多点(最精细) 2/3/4 依次更稀疏
-        max_iteration: 3                        # 每帧迭代次数，略增有利于收敛与细节
+        point_filter_num: 5                     # 1=保留最多点(最精细) 2/3/4 依次更稀疏
+        max_iteration: 5                        # 每帧迭代次数，略增有利于收敛与细节
         filter_size_surf: 0.3                  # 匹配用体素(m)：越小匹配越细，当前偏精细
         filter_size_map: 0.3                   # 地图体素(m)：越小地图分辨率越高
         cube_side_length: 1000.0
@@ -19,24 +19,26 @@
 
         preprocess:
             lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 4 for any other pointcloud input
-            scan_line:  6
+            scan_line:  4
             blind: 0.84
             timestamp_unit: 3
             scan_rate: 20
 
         mapping:
             # 顺滑路径：减小 IMU 过程噪声，更信任 IMU 预测，轨迹更平滑（若过于平滑可适当增大）
-            acc_cov: 0.05                       # 0.1->0.05 更信 IMU，位姿更顺
-            gyr_cov: 0.05                       # 0.1->0.05 同上
+            acc_cov: 0.1                       # 0.1->0.05 更信 IMU，位姿更顺
+            gyr_cov: 0.1                       # 0.1->0.05 同上
             b_acc_cov: 0.0001
             b_gyr_cov: 0.0001
             fov_degree:    360.0
             det_range:     100.0
             extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
+            # Mid360 机身自带 IMU，同体 T=0。仿真中点云与 IMU 已对齐时用单位阵可得到水平点云/path
             extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
             extrinsic_R: [ 1., 0., 0.,
                             0., 1., 0.,
                             0., 0., 1.]
+            # 若实机雷达 pitch 90° 安装且点云倾斜，可改用: [ 0,0,1 / 0,1,0 / -1,0,0 ]
 
         publish:
             path_en: true                # true: publish Path

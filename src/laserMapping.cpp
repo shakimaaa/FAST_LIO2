@@ -635,15 +635,15 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.child_frame_id = "_body";
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    // 填充线速度：state_point.vel 为世界系，twist 按 REP 103 使用 body 系
-    Eigen::Vector3d vel_body = state_point.rot.toRotationMatrix().transpose() * Eigen::Vector3d(state_point.vel(0), state_point.vel(1), state_point.vel(2));
-    odomAftMapped.twist.twist.linear.x = vel_body(0);
-    odomAftMapped.twist.twist.linear.y = vel_body(1);
-    odomAftMapped.twist.twist.linear.z = vel_body(2);
+    // // 填充线速度：state_point.vel 为世界系，twist 按 REP 103 使用 body 系
+    // Eigen::Vector3d vel_body = state_point.rot.toRotationMatrix().transpose() * Eigen::Vector3d(state_point.vel(0), state_point.vel(1), state_point.vel(2));
+    odomAftMapped.twist.twist.linear.x = state_point.vel(0);
+    odomAftMapped.twist.twist.linear.y = state_point.vel(1);
+    odomAftMapped.twist.twist.linear.z = state_point.vel(2);
     odomAftMapped.twist.twist.angular.x = 0.0;
     odomAftMapped.twist.twist.angular.y = 0.0;
     odomAftMapped.twist.twist.angular.z = 0.0;
-    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "vel_body: %f, %f, %f", vel_body(0), vel_body(1), vel_body(2));
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "vel_body: %f, %f, %f", state_point.vel(0), state_point.vel(1), state_point.vel(2));
     auto P = kf.get_P();
     // 线速度协方差：状态中 vel 在索引 12~14（世界系），变换到 body 系后填入 twist.covariance
     // 协方差矩阵中 vel 的协方差为 0.0001，即 0.0001 * I
@@ -668,17 +668,17 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
 
-    // 发布camera_init -> base_link TF
+    // 发布 camera_init -> base TF（camera_init 相对 base 绕 Y 轴 pitch 向下 90°）
     geometry_msgs::msg::TransformStamped trans_camera_init_base_link;
     trans_camera_init_base_link.header.frame_id = "base";
     trans_camera_init_base_link.child_frame_id = "camera_init";
     trans_camera_init_base_link.header.stamp = get_ros_time(lidar_end_time);
-    trans_camera_init_base_link.transform.translation.x = 0.3;
+    trans_camera_init_base_link.transform.translation.x = 0.0;
     trans_camera_init_base_link.transform.translation.y = 0.0;
-    trans_camera_init_base_link.transform.translation.z = 0.3;
-    trans_camera_init_base_link.transform.rotation.w = 1.0;
+    trans_camera_init_base_link.transform.translation.z = 0.0;
+    trans_camera_init_base_link.transform.rotation.w = 0.70710678;
     trans_camera_init_base_link.transform.rotation.x = 0.0;
-    trans_camera_init_base_link.transform.rotation.y = 0.0;
+    trans_camera_init_base_link.transform.rotation.y = 0.70710678;
     trans_camera_init_base_link.transform.rotation.z = 0.0;
     tf_br->sendTransform(trans_camera_init_base_link);
     geometry_msgs::msg::TransformStamped trans;
