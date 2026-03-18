@@ -57,6 +57,8 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
@@ -866,7 +868,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     trans_camera_init_base_link.header.frame_id = "base";
     trans_camera_init_base_link.child_frame_id = "camera_init";
     trans_camera_init_base_link.header.stamp = get_ros_time(lidar_end_time);
-    trans_camera_init_base_link.transform.translation.x = 0.0;
+    trans_camera_init_base_link.transform.translation.x = 0.5;
     trans_camera_init_base_link.transform.translation.y = 0.0;
     trans_camera_init_base_link.transform.translation.z = 0.0;
     trans_camera_init_base_link.transform.rotation.w = 0.70710678;
@@ -874,6 +876,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     trans_camera_init_base_link.transform.rotation.y = 0.70710678;
     trans_camera_init_base_link.transform.rotation.z = 0.0;
     tf_br->sendTransform(trans_camera_init_base_link);
+
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = "camera_init";
     trans.child_frame_id = "_body";
@@ -887,6 +890,74 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
     tf_br->sendTransform(trans);
 
+    // 从 _body 四元数提取 yaw（Z-Y-X 欧拉角中的 Z 轴旋转），用于“仅 yaw”的坐标系
+    double body_yaw_in_camera_init = 0.0;
+    double pitch;
+    double yaw;
+    {
+        double qw = trans.transform.rotation.w;
+        double qx = trans.transform.rotation.x;
+        double qy = trans.transform.rotation.y;
+        double qz = trans.transform.rotation.z;
+        // Z-Y-X 下 yaw: siny_cosp = 2*(qw*qz + qx*qy), cosy_cosp = 1 - 2*(qy*qy + qz*qz)
+        double sinr_cosp = 2.0 * (qw * qx + qy * qz);
+        double cosr_cosp = 1.0 - 2.0 * (qx * qx + qy * qy);
+        body_yaw_in_camera_init = std::atan2(sinr_cosp, cosr_cosp);
+        // pitch: 绕 camera_init 的 Y（左）轴
+        double sinp = 2.0 * (qw * qy - qz * qx);
+        if (std::abs(sinp) >= 1)
+            pitch = std::copysign(M_PI / 2, sinp);
+        else
+            pitch = std::asin(sinp);
+
+        // yaw (Z)
+        double siny_cosp = 2.0 * (qw * qz + qx * qy);
+        double cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz);
+        yaw = std::atan2(siny_cosp, cosy_cosp);
+
+        // 使“下坡/低头”始终为正：yaw≈0 时标准 pitch 已对；yaw≈±π 时需取反
+        if (std::cos(body_yaw_in_camera_init) < 0)
+            pitch = -pitch;
+    }
+
+    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "body_yaw_in_camera_init: %f, pitch: %f, yaw: %f", body_yaw_in_camera_init, pitch, yaw);
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "pitch: %f", pitch);
+    
+    geometry_msgs::msg::TransformStamped trans_body_yaw;
+    trans_body_yaw.header.frame_id = "camera_init";
+    trans_body_yaw.child_frame_id = "body_yaw";
+    trans_body_yaw.header.stamp = get_ros_time(lidar_end_time);
+    trans_body_yaw.transform.translation.x = odomAftMapped.pose.pose.position.x;
+    trans_body_yaw.transform.translation.y = odomAftMapped.pose.pose.position.y;
+    trans_body_yaw.transform.translation.z = odomAftMapped.pose.pose.position.z;
+    {
+        tf2::Quaternion q;
+        q.setRPY(body_yaw_in_camera_init, 0.0, 0.0);
+        q.normalize();
+        trans_body_yaw.transform.rotation.x = q.x();
+        trans_body_yaw.transform.rotation.y = q.y();
+        trans_body_yaw.transform.rotation.z = q.z();
+        trans_body_yaw.transform.rotation.w = q.w();
+    }
+    tf_br->sendTransform(trans_body_yaw);
+
+    double offset_x = -0.5 * sin(pitch);
+    double offset_z = -0.5 * cos(pitch);
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "offset_x: %f, offset_z: %f", offset_x, offset_z);
+    // 发布 body_yaw -> robot
+    geometry_msgs::msg::TransformStamped trans_body_yaw_robot;
+    trans_body_yaw_robot.header.frame_id = "body_yaw";
+    trans_body_yaw_robot.child_frame_id = "robot";
+    trans_body_yaw_robot.header.stamp = get_ros_time(lidar_end_time);
+    trans_body_yaw_robot.transform.translation.x = offset_x;
+    trans_body_yaw_robot.transform.translation.y = 0.0;
+    trans_body_yaw_robot.transform.translation.z = offset_z;
+    trans_body_yaw_robot.transform.rotation.w = 0.70710678;
+    trans_body_yaw_robot.transform.rotation.x = 0.0;
+    trans_body_yaw_robot.transform.rotation.y = -0.70710678;
+    trans_body_yaw_robot.transform.rotation.z = 0.0;
+    tf_br->sendTransform(trans_body_yaw_robot);
+    
     // 仅 Airy：body -> rslidar，用 Lidar-IMU 外参把 body 下的点云恢复到雷达“正”的坐标系
     if (p_pre->lidar_type == AIRY)
     {

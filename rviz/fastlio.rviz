@@ -7,6 +7,7 @@ Panels:
         - /Global Options1
         - /Status1
         - /Odometry1
+        - /GridMap1
       Splitter Ratio: 0.5
     Tree Height: 774
   - Class: rviz_common/Selection
@@ -26,7 +27,7 @@ Panels:
     Experimental: false
     Name: Time
     SyncMode: 0
-    SyncSource: CloudRegistered
+    SyncSource: PointCloud2
 Visualization Manager:
   Class: ""
   Displays:
@@ -103,6 +104,10 @@ Visualization Manager:
           Value: true
         odom:
           Value: true
+        robot:
+          Value: true
+        robot_yaw:
+          Value: true
         world:
           Value: true
       Marker Scale: 1
@@ -115,6 +120,9 @@ Visualization Manager:
           camera_init:
             _body:
               {}
+            robot:
+              robot_yaw:
+                {}
       Update Interval: 0
       Value: true
     - Angle Tolerance: 0.10000000149011612
@@ -134,7 +142,7 @@ Visualization Manager:
           Scale: 1
           Value: true
         Value: true
-      Enabled: true
+      Enabled: false
       Keep: 1
       Name: Odometry
       Position Tolerance: 0.10000000149011612
@@ -155,7 +163,7 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /Odometry
-      Value: true
+      Value: false
     - Alpha: 1
       Buffer Length: 1
       Class: rviz_default_plugins/Path
@@ -426,25 +434,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 8.603809356689453
+      Distance: 0.6028232574462891
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.1639011800289154
-        Y: -0.4023124575614929
-        Z: 0.40397951006889343
+        X: 0.46106985211372375
+        Y: 0.953416109085083
+        Z: 0.6033116579055786
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.4147976338863373
+      Pitch: 0.3597978353500366
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz_default_plugins)
-      Yaw: 2.812325954437256
+      Yaw: 1.3892046213150024
     Saved: ~
 Window Geometry:
   Displays:
@@ -462,5 +470,5 @@ Window Geometry:
   Views:
     collapsed: false
   Width: 1193
-  X: 566
-  Y: 327
+  X: 1309
+  Y: 115

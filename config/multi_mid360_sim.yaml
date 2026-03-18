@@ -4,8 +4,8 @@
         # 精细建图：保留更多点、更小体素、更多迭代（仿真可偏激进，实机需权衡算力）
         point_filter_num: 3                     # 1=保留最多点(最精细) 2/3/4 依次更稀疏
         max_iteration: 3                        # 每帧迭代次数，略增有利于收敛与细节
-        filter_size_surf: 0.5                  # 匹配用体素(m)：越小匹配越细，当前偏精细
-        filter_size_map: 0.5                   # 地图体素(m)：越小地图分辨率越高
+        filter_size_surf: 0.3                  # 匹配用体素(m)：越小匹配越细，当前偏精细
+        filter_size_map: 0.3                   # 地图体素(m)：越小地图分辨率越高
         cube_side_length: 1000.0
         runtime_pos_log_enable: false
         map_file_path: "./src/LIO/FAST_LIO2/PCD/test1.pcd"
@@ -23,7 +23,7 @@
             scan_line:  4
             blind: 0.5
             timestamp_unit: 3
-            scan_rate: 20
+            scan_rate: 16
 
         mapping:
             # 顺滑路径：减小 IMU 过程噪声，更信任 IMU 预测，轨迹更平滑（若过于平滑可适当增大）
