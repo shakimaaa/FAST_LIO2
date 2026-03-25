@@ -157,7 +157,16 @@ geometry_msgs::msg::Quaternion geoQuat;
 geometry_msgs::msg::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
+/** 多雷达时第二路独立 preprocess，可与主雷达 lidar_type / 线数等不同 */
+shared_ptr<Preprocess> p_pre_2(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
+
+static inline bool any_lidar_is_airy()
+{
+    if (p_pre->lidar_type == AIRY) return true;
+    if (multi_en && p_pre_2->lidar_type == AIRY) return true;
+    return false;
+}
 
 void SigHandle(int sig)
 {
@@ -450,8 +459,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     // 构造输出点云
     PointCloudXYZI::Ptr lidar2_ptr(new PointCloudXYZI());
     PointCloudXYZI::Ptr filtered_ptr(new PointCloudXYZI());
-    // 使用与主lidar一致的处理方式
-    p_pre->process(msg, lidar2_ptr);
+    p_pre_2->process(msg, lidar2_ptr);
 
     // 利用外参 (Lidar2_R_wrt_Lidar, Lidar2_T_wrt_Lidar) 将点云从雷达2坐标系变换到主雷达坐标系
     for (auto& point : lidar2_ptr->points) {
@@ -507,6 +515,34 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     imu_buffer.push_back(msg);
     mtx_buffer.unlock();
     sig_buffer.notify_all();
+}
+
+/** 第二路 PointCloud2（Velodyne / Ouster / MID360 等非 Livox CustomMsg） */
+void standard_pcl_cbk2(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
+{
+    RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping"), "Lidar 2 standard PCL callback");
+
+    PointCloudXYZI::Ptr lidar2_ptr(new PointCloudXYZI());
+    PointCloudXYZI::Ptr filtered_ptr(new PointCloudXYZI());
+    p_pre_2->process(msg, lidar2_ptr);
+
+    for (auto& point : lidar2_ptr->points) {
+        Eigen::Vector3d pt_lidar2(point.x, point.y, point.z);
+        Eigen::Vector3d pt_lidar1 = Lidar2_R_wrt_Lidar * pt_lidar2 + Lidar2_T_wrt_Lidar;
+        point.x = pt_lidar1(0);
+        point.y = pt_lidar1(1);
+        point.z = pt_lidar1(2);
+    }
+
+    filtered_ptr->points.reserve(lidar2_ptr->points.size());
+    PointCloudXYZI::Ptr removed_ptr(new PointCloudXYZI());
+    filter_rear_legs_lidar1(lidar2_ptr, filtered_ptr, removed_ptr);
+
+    {
+        std::lock_guard<std::mutex> lock(mtx_buffer);
+        lidar_buffer_2.push_back(filtered_ptr);
+        lidar2_removed_cloud = removed_ptr;
+    }
 }
 
 double lidar_mean_scantime = 0.0;
@@ -756,7 +792,7 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = (p_pre->lidar_type == AIRY) ? "rslidar" : "_body";
+    laserCloudmsg.header.frame_id = any_lidar_is_airy() ? "rslidar" : "_body";
     pubLaserCloudFull_body->publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
 }
@@ -827,31 +863,104 @@ void set_posestamp(T & out)
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
 {
     odomAftMapped.header.frame_id = "camera_init";
-    odomAftMapped.child_frame_id = "_body";
+    odomAftMapped.child_frame_id = "robot";
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
-    set_posestamp(odomAftMapped.pose);
-    // // 填充线速度：state_point.vel 为世界系，twist 按 REP 103 使用 body 系
-    // Eigen::Vector3d vel_body = state_point.rot.toRotationMatrix().transpose() * Eigen::Vector3d(state_point.vel(0), state_point.vel(1), state_point.vel(2));
-    odomAftMapped.twist.twist.linear.x = state_point.vel(0);
-    odomAftMapped.twist.twist.linear.y = state_point.vel(1);
-    odomAftMapped.twist.twist.linear.z = state_point.vel(2);
-    odomAftMapped.twist.twist.angular.x = 0.0;
-    odomAftMapped.twist.twist.angular.y = 0.0;
-    odomAftMapped.twist.twist.angular.z = 0.0;
-    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "vel_body: %f, %f, %f", state_point.vel(0), state_point.vel(1), state_point.vel(2));
+
+    // 与 TF body_yaw、robot 一致：R_camera_init_robot = R_ci_body_yaw * R_body_yaw_robot
+    double body_yaw_in_camera_init = 0.0;
+    double pitch = 0.0;
+    {
+        double qw = geoQuat.w;
+        double qx = geoQuat.x;
+        double qy = geoQuat.y;
+        double qz = geoQuat.z;
+        double sinr_cosp = 2.0 * (qw * qx + qy * qz);
+        double cosr_cosp = 1.0 - 2.0 * (qx * qx + qy * qy);
+        body_yaw_in_camera_init = std::atan2(sinr_cosp, cosr_cosp);
+        double sinp = 2.0 * (qw * qy - qz * qx);
+        if (std::abs(sinp) >= 1)
+            pitch = std::copysign(M_PI / 2, sinp);
+        else
+            pitch = std::asin(sinp);
+        if (std::cos(body_yaw_in_camera_init) < 0)
+            pitch = -pitch;
+    }
+    const double offset_x = -0.5 * sin(pitch);
+    const double offset_z = -0.5 * cos(pitch);
+
+    tf2::Quaternion q_ci_by;
+    q_ci_by.setRPY(body_yaw_in_camera_init, 0.0, 0.0);
+    q_ci_by.normalize();
+    tf2::Matrix3x3 m_ci_by(q_ci_by);
+    Eigen::Matrix3d R_ci_by;
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            R_ci_by(r, c) = m_ci_by[r][c];
+
+    tf2::Quaternion q_by_ro(0.0, -0.70710678, 0.0, 0.70710678);
+    tf2::Matrix3x3 m_by_ro(q_by_ro);
+    Eigen::Matrix3d R_by_ro;
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            R_by_ro(r, c) = m_by_ro[r][c];
+
+    const Eigen::Matrix3d R_ci_ro = R_ci_by * R_by_ro;
+    const Eigen::Vector3d t_by_ro(offset_x, 0.0, offset_z);
+    const Eigen::Vector3d p_imu(state_point.pos(0), state_point.pos(1), state_point.pos(2));
+    const Eigen::Vector3d p_robot_ci = p_imu + R_ci_by * t_by_ro;
+
+    odomAftMapped.pose.pose.position.x = p_robot_ci(0);
+    odomAftMapped.pose.pose.position.y = p_robot_ci(1);
+    odomAftMapped.pose.pose.position.z = p_robot_ci(2);
+    {
+        Eigen::Quaterniond q_ci_ro(R_ci_ro);
+        q_ci_ro.normalize();
+        odomAftMapped.pose.pose.orientation.x = q_ci_ro.x();
+        odomAftMapped.pose.pose.orientation.y = q_ci_ro.y();
+        odomAftMapped.pose.pose.orientation.z = q_ci_ro.z();
+        odomAftMapped.pose.pose.orientation.w = q_ci_ro.w();
+    }
+
+    // 局部速度：robot 原点在世界系下的速度，再投影到 robot 轴（非世界系分量）
+    const Eigen::Matrix3d R_wb = state_point.rot.toRotationMatrix();
+    Eigen::Vector3d omega_b(0.0, 0.0, 0.0);
+    if (!Measures.imu.empty())
+    {
+        const auto &im = Measures.imu.back();
+        omega_b << im->angular_velocity.x - state_point.bg(0),
+            im->angular_velocity.y - state_point.bg(1),
+            im->angular_velocity.z - state_point.bg(2);
+    }
+    const Eigen::Vector3d omega_w = R_wb * omega_b;
+    const Eigen::Vector3d delta_w = R_ci_by * t_by_ro;
+    const Eigen::Vector3d v_imu_w(state_point.vel(0), state_point.vel(1), state_point.vel(2));
+    const Eigen::Vector3d v_robot_w = v_imu_w + omega_w.cross(delta_w);
+    const Eigen::Vector3d v_robot = R_ci_ro.transpose() * v_robot_w;
+    const Eigen::Vector3d omega_robot = R_ci_ro.transpose() * omega_w;
+
+    odomAftMapped.twist.twist.linear.x = v_robot(0);
+    odomAftMapped.twist.twist.linear.y = v_robot(1);
+    odomAftMapped.twist.twist.linear.z = v_robot(2);
+    odomAftMapped.twist.twist.angular.x = omega_robot(0);
+    odomAftMapped.twist.twist.angular.y = omega_robot(1);
+    odomAftMapped.twist.twist.angular.z = omega_robot(2);
+
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "v_robot_x: %f",  v_robot(0));
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "v_robot_y: %f",  v_robot(1));
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "v_robot_z: %f",  v_robot(2));
+
+
     auto P = kf.get_P();
-    // 线速度协方差：状态中 vel 在索引 12~14（世界系），变换到 body 系后填入 twist.covariance
-    // 协方差矩阵中 vel 的协方差为 0.0001，即 0.0001 * I
     Eigen::Matrix3d P_vel_world = P.block<3, 3>(12, 12);
-    Eigen::Matrix3d R = state_point.rot.toRotationMatrix();
-    Eigen::Matrix3d P_vel_body = R.transpose() * P_vel_world * R;
+    Eigen::Matrix3d P_vel_robot = R_ci_ro.transpose() * P_vel_world * R_ci_ro;
     for (int i = 0; i < 3; i++)
         for (int j = 0; j < 3; j++)
-            odomAftMapped.twist.covariance[i * 6 + j] = P_vel_body(i, j);
-    // 角速度未估计，协方差置为 -1 表示未知
+            odomAftMapped.twist.covariance[i * 6 + j] = P_vel_robot(i, j);
+
+    const double gyr_var = gyr_cov * gyr_cov;
     for (int i = 3; i < 6; i++)
-        odomAftMapped.twist.covariance[i * 6 + i] = -1.0;
-    pubOdomAftMapped->publish(odomAftMapped);
+        odomAftMapped.twist.covariance[i * 6 + i] = gyr_var;
+
     for (int i = 0; i < 6; i ++)
     {
         int k = i < 3 ? i + 3 : i - 3;
@@ -862,6 +971,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
+    pubOdomAftMapped->publish(odomAftMapped);
 
     // 发布 camera_init -> base TF（camera_init 相对 base 绕 Y 轴 pitch 向下 90°）
     geometry_msgs::msg::TransformStamped trans_camera_init_base_link;
@@ -881,69 +991,31 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     trans.header.frame_id = "camera_init";
     trans.child_frame_id = "_body";
     trans.header.stamp = get_ros_time(lidar_end_time);
-    trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
-    trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
-    trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
-    trans.transform.rotation.w = odomAftMapped.pose.pose.orientation.w;
-    trans.transform.rotation.x = odomAftMapped.pose.pose.orientation.x;
-    trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
-    trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
+    trans.transform.translation.x = state_point.pos(0);
+    trans.transform.translation.y = state_point.pos(1);
+    trans.transform.translation.z = state_point.pos(2);
+    trans.transform.rotation.w = geoQuat.w;
+    trans.transform.rotation.x = geoQuat.x;
+    trans.transform.rotation.y = geoQuat.y;
+    trans.transform.rotation.z = geoQuat.z;
     tf_br->sendTransform(trans);
 
-    // 从 _body 四元数提取 yaw（Z-Y-X 欧拉角中的 Z 轴旋转），用于“仅 yaw”的坐标系
-    double body_yaw_in_camera_init = 0.0;
-    double pitch;
-    double yaw;
-    {
-        double qw = trans.transform.rotation.w;
-        double qx = trans.transform.rotation.x;
-        double qy = trans.transform.rotation.y;
-        double qz = trans.transform.rotation.z;
-        // Z-Y-X 下 yaw: siny_cosp = 2*(qw*qz + qx*qy), cosy_cosp = 1 - 2*(qy*qy + qz*qz)
-        double sinr_cosp = 2.0 * (qw * qx + qy * qz);
-        double cosr_cosp = 1.0 - 2.0 * (qx * qx + qy * qy);
-        body_yaw_in_camera_init = std::atan2(sinr_cosp, cosr_cosp);
-        // pitch: 绕 camera_init 的 Y（左）轴
-        double sinp = 2.0 * (qw * qy - qz * qx);
-        if (std::abs(sinp) >= 1)
-            pitch = std::copysign(M_PI / 2, sinp);
-        else
-            pitch = std::asin(sinp);
-
-        // yaw (Z)
-        double siny_cosp = 2.0 * (qw * qz + qx * qy);
-        double cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz);
-        yaw = std::atan2(siny_cosp, cosy_cosp);
-
-        // 使“下坡/低头”始终为正：yaw≈0 时标准 pitch 已对；yaw≈±π 时需取反
-        if (std::cos(body_yaw_in_camera_init) < 0)
-            pitch = -pitch;
-    }
-
-    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "body_yaw_in_camera_init: %f, pitch: %f, yaw: %f", body_yaw_in_camera_init, pitch, yaw);
     RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "pitch: %f", pitch);
-    
+
     geometry_msgs::msg::TransformStamped trans_body_yaw;
     trans_body_yaw.header.frame_id = "camera_init";
     trans_body_yaw.child_frame_id = "body_yaw";
     trans_body_yaw.header.stamp = get_ros_time(lidar_end_time);
-    trans_body_yaw.transform.translation.x = odomAftMapped.pose.pose.position.x;
-    trans_body_yaw.transform.translation.y = odomAftMapped.pose.pose.position.y;
-    trans_body_yaw.transform.translation.z = odomAftMapped.pose.pose.position.z;
-    {
-        tf2::Quaternion q;
-        q.setRPY(body_yaw_in_camera_init, 0.0, 0.0);
-        q.normalize();
-        trans_body_yaw.transform.rotation.x = q.x();
-        trans_body_yaw.transform.rotation.y = q.y();
-        trans_body_yaw.transform.rotation.z = q.z();
-        trans_body_yaw.transform.rotation.w = q.w();
-    }
+    trans_body_yaw.transform.translation.x = state_point.pos(0);
+    trans_body_yaw.transform.translation.y = state_point.pos(1);
+    trans_body_yaw.transform.translation.z = state_point.pos(2);
+    trans_body_yaw.transform.rotation.x = q_ci_by.x();
+    trans_body_yaw.transform.rotation.y = q_ci_by.y();
+    trans_body_yaw.transform.rotation.z = q_ci_by.z();
+    trans_body_yaw.transform.rotation.w = q_ci_by.w();
     tf_br->sendTransform(trans_body_yaw);
 
-    double offset_x = -0.5 * sin(pitch);
-    double offset_z = -0.5 * cos(pitch);
-    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "offset_x: %f, offset_z: %f", offset_x, offset_z);
+    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "offset_x: %f, offset_z: %f", offset_x, offset_z);
     // 发布 body_yaw -> robot
     geometry_msgs::msg::TransformStamped trans_body_yaw_robot;
     trans_body_yaw_robot.header.frame_id = "body_yaw";
@@ -959,7 +1031,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     tf_br->sendTransform(trans_body_yaw_robot);
     
     // 仅 Airy：body -> rslidar，用 Lidar-IMU 外参把 body 下的点云恢复到雷达“正”的坐标系
-    if (p_pre->lidar_type == AIRY)
+    if (any_lidar_is_airy())
     {
         geometry_msgs::msg::TransformStamped trans_rslidar;
         trans_rslidar.header.frame_id = "_body";
@@ -1157,6 +1229,10 @@ public:
         this->declare_parameter<vector<double>>("multi.Lidar2_to_Lidar_T", vector<double>());
         this->declare_parameter<vector<double>>("multi.Lidar2_to_Lidar_R", vector<double>());
         this->declare_parameter<bool>("multi.removed_en", false);
+        this->declare_parameter<int>("multi.lidar_type", -1);   // -1: 与 preprocess.lidar_type 相同
+        this->declare_parameter<int>("multi.scan_line", -1);    // -1: 与主雷达 N_SCANS 相同
+        this->declare_parameter<int>("multi.timestamp_unit", -1); // -1: 与主雷达 time_unit 相同
+        this->declare_parameter<int>("multi.scan_rate", -1);     // -1: 与主雷达 SCAN_RATE 相同
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -1199,6 +1275,29 @@ public:
         this->get_parameter_or<vector<double>>("multi.Lidar2_to_Lidar_T", Lidar2_to_Lidar_T, vector<double>());
         this->get_parameter_or<vector<double>>("multi.Lidar2_to_Lidar_R", Lidar2_to_Lidar_R, vector<double>());
         this->get_parameter_or<bool>("multi.removed_en", removed_en, false);
+
+        // 第二路 preprocess：默认与主雷达一致，multi.* 可单独覆盖（支持异构雷达）
+        p_pre_2->blind = p_pre->blind;
+        p_pre_2->point_filter_num = p_pre->point_filter_num;
+        p_pre_2->N_SCANS = p_pre->N_SCANS;
+        p_pre_2->SCAN_RATE = p_pre->SCAN_RATE;
+        p_pre_2->time_unit = p_pre->time_unit;
+        p_pre_2->feature_enabled = p_pre->feature_enabled;
+        p_pre_2->given_offset_time = p_pre->given_offset_time;
+        {
+            int multi_lidar_type = -1;
+            this->get_parameter_or<int>("multi.lidar_type", multi_lidar_type, -1);
+            p_pre_2->lidar_type = (multi_lidar_type >= 0) ? multi_lidar_type : p_pre->lidar_type;
+            int multi_scan_line = -1;
+            this->get_parameter_or<int>("multi.scan_line", multi_scan_line, -1);
+            if (multi_scan_line > 0) p_pre_2->N_SCANS = multi_scan_line;
+            int multi_tu = -1;
+            this->get_parameter_or<int>("multi.timestamp_unit", multi_tu, -1);
+            if (multi_tu >= 0) p_pre_2->time_unit = multi_tu;
+            int multi_sr = -1;
+            this->get_parameter_or<int>("multi.scan_rate", multi_sr, -1);
+            if (multi_sr > 0) p_pre_2->SCAN_RATE = multi_sr;
+        }
 
         if (debug_info)
         {
@@ -1248,6 +1347,13 @@ public:
             RCLCPP_INFO(this->get_logger(), "%smulti_en%s: %s%s%s", COLOR_ITEM, COLOR_RESET, multi_en ? COLOR_BOOL_ON : COLOR_BOOL_OFF, multi_en ? "true" : "false", COLOR_RESET);
             RCLCPP_INFO(this->get_logger(), "%slid_topic_2%s: %s%s%s", COLOR_ITEM, COLOR_RESET, COLOR_STRING, lid_topic_2.c_str(), COLOR_RESET);
             RCLCPP_INFO(this->get_logger(), "%sremoved_en%s: %s%s%s", COLOR_ITEM, COLOR_RESET, removed_en ? COLOR_BOOL_ON : COLOR_BOOL_OFF, removed_en ? "true" : "false", COLOR_RESET);
+            if (multi_en)
+            {
+                RCLCPP_INFO(this->get_logger(), "%sp_pre_2->lidar_type%s: %s%d%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, p_pre_2->lidar_type, COLOR_RESET);
+                RCLCPP_INFO(this->get_logger(), "%sp_pre_2->N_SCANS%s: %s%d%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, p_pre_2->N_SCANS, COLOR_RESET);
+                RCLCPP_INFO(this->get_logger(), "%sp_pre_2->time_unit%s: %s%d%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, p_pre_2->time_unit, COLOR_RESET);
+                RCLCPP_INFO(this->get_logger(), "%sp_pre_2->SCAN_RATE%s: %s%d%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, p_pre_2->SCAN_RATE, COLOR_RESET);
+            }
             
 
             // 打印 extrinT 和 extrinR
@@ -1346,6 +1452,8 @@ public:
 
         rclcpp::SubscriptionOptions pcl_options;
             pcl_options.callback_group = pcl_callback_group_;
+        rclcpp::SubscriptionOptions pcl_options_2;
+            pcl_options_2.callback_group = pcl_callback_group_2;
         rclcpp::SubscriptionOptions pcl_livox_options;
             pcl_livox_options.callback_group = pcl_livoxcallback_group_;
         rclcpp::SubscriptionOptions pcl_livox_options_2;
@@ -1357,7 +1465,16 @@ public:
 
         if (multi_en)
         {
-            sub_pcl_livox_2_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic_2, 20, livox_pcl_cbk2, pcl_livox_options_2);
+            if (p_pre_2->lidar_type == AVIA)
+            {
+                sub_pcl_livox_2_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(
+                    lid_topic_2, 20, livox_pcl_cbk2, pcl_livox_options_2);
+            }
+            else
+            {
+                sub_pcl_pc_2_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+                    lid_topic_2, rclcpp::SensorDataQoS(), standard_pcl_cbk2, pcl_options_2);
+            }
         }
         if (p_pre->lidar_type == AVIA)
         {
@@ -1595,10 +1712,12 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_2_;
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_2_;
 
     // Callback Group
     rclcpp::CallbackGroup::SharedPtr imu_callback_group_;
     rclcpp::CallbackGroup::SharedPtr pcl_callback_group_;
+    rclcpp::CallbackGroup::SharedPtr pcl_callback_group_2;
     rclcpp::CallbackGroup::SharedPtr pcl_livoxcallback_group_;
     rclcpp::CallbackGroup::SharedPtr pcl_livoxcallback_group_2;
     rclcpp::CallbackGroup::SharedPtr timer_callback_group_;
