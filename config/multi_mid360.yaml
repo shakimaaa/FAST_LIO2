@@ -1,0 +1,72 @@
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        # 精细建图：保留更多点、更小体素、更多迭代（仿真可偏激进，实机需权衡算力）
+        point_filter_num: 3                     # 1=保留最多点(最精细) 2/3/4 依次更稀疏
+        max_iteration: 3                        # 每帧迭代次数，略增有利于收敛与细节
+        filter_size_surf: 0.3                  # 匹配用体素(m)：越小匹配越细，当前偏精细
+        filter_size_map: 0.3                   # 地图体素(m)：越小地图分辨率越高
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: false
+        map_file_path: "./src/LIO/FAST_LIO2/PCD/test1.pcd"
+
+        common:
+            lid_topic:  "/livox/lidar"    #"/mid360"
+            imu_topic:  "/livox/imu"                  #"/mid360/imu"
+            time_sync_en: false         # Disabled since IMU and LiDAR now use the same simulation time base
+            time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
+                                        # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
+            debug_info: true
+
+        preprocess:
+            lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 4 for any other pointcloud input
+            scan_line:  4
+            blind: 0.5
+            timestamp_unit: 3
+            scan_rate: 10
+
+        mapping:
+            # 顺滑路径：减小 IMU 过程噪声，更信任 IMU 预测，轨迹更平滑（若过于平滑可适当增大）
+            acc_cov: 0.1                       # 0.1->0.05 更信 IMU，位姿更顺
+            gyr_cov: 0.1                       # 0.1->0.05 同上
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            fov_degree:    360.0
+            det_range:     100.0
+            extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
+            # Mid360 机身自带 IMU，同体 T=0。仿真中点云与 IMU 已对齐时用单位阵可得到水平点云/path
+            extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+            extrinsic_R: [ 1., 0., 0.,
+                            0., 1., 0.,
+                            0., 0., 1.]
+            # 若实机雷达 pitch 90° 安装且点云倾斜，可改用: [ 0,0,1 / 0,1,0 / -1,0,0 ]
+        multi:
+            # 第二路雷达类型；-1 或与省略表示与 preprocess.lidar_type 相同
+            # 1=Livox CustomMsg，2=Velodyne，3=Ouster，4=通用 PointCloud2，5=Airy（非 1 时用 sensor_msgs/PointCloud2 订阅 lid_topic_2）
+            lidar_type: 1
+            # 可选：与主雷达线数/时间单位/扫描率不同时再设（-1 表示沿用主雷达）
+            # scan_line: 16
+            # timestamp_unit: 3
+            # scan_rate: 16
+            multi_en: true
+            removed_en: false
+            lid_topic_2:  "/mid360_2"
+            # 2号雷达相对于1号雷达的位姿
+            Lidar2_to_Lidar_T: [ 0.0998, 0., -0.2001 ]
+            Lidar2_to_Lidar_R: [ 0.25978189, 0.0,   0.96566732,
+                                  0.0,        1.0,   0.0,
+                                 -0.96566732, 0.0,   0.25978189 ]
+            
+
+        publish:
+            path_en: true                # true: publish Path
+            effect_map_en: false         # true: publish Effects
+            map_en: true                 # true: publish Map cloud
+            scan_publish_en:  true       # false: close all the point cloud output
+            dense_publish_en: true       # true: 保存/发布地图用未降采样点云，精细建图建议 true
+            scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
+
+        pcd_save:
+            pcd_save_en: true
+            interval: -1                 # how many LiDAR frames saved in each pcd file; 
+                                        # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.

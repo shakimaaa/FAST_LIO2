@@ -57,6 +57,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -388,6 +389,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     scan_count ++;
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "time diff: %f", cur_time - last_timestamp_lidar);
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
@@ -417,6 +419,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
     scan_count ++;
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "time diff: %f", cur_time - last_timestamp_lidar);
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
@@ -945,9 +948,9 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.twist.twist.angular.y = omega_robot(1);
     odomAftMapped.twist.twist.angular.z = omega_robot(2);
 
-    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "v_robot_x: %f",  v_robot(0));
-    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "v_robot_y: %f",  v_robot(1));
-    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "v_robot_z: %f",  v_robot(2));
+    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "v_robot_x: %f",  v_robot(0));
+    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "v_robot_y: %f",  v_robot(1));
+    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "v_robot_z: %f",  v_robot(2));
 
 
     auto P = kf.get_P();
@@ -973,20 +976,6 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     }
     pubOdomAftMapped->publish(odomAftMapped);
 
-    // 发布 camera_init -> base TF（camera_init 相对 base 绕 Y 轴 pitch 向下 90°）
-    geometry_msgs::msg::TransformStamped trans_camera_init_base_link;
-    trans_camera_init_base_link.header.frame_id = "base";
-    trans_camera_init_base_link.child_frame_id = "camera_init";
-    trans_camera_init_base_link.header.stamp = get_ros_time(lidar_end_time);
-    trans_camera_init_base_link.transform.translation.x = 0.5;
-    trans_camera_init_base_link.transform.translation.y = 0.0;
-    trans_camera_init_base_link.transform.translation.z = 0.0;
-    trans_camera_init_base_link.transform.rotation.w = 0.70710678;
-    trans_camera_init_base_link.transform.rotation.x = 0.0;
-    trans_camera_init_base_link.transform.rotation.y = 0.70710678;
-    trans_camera_init_base_link.transform.rotation.z = 0.0;
-    tf_br->sendTransform(trans_camera_init_base_link);
-
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = "camera_init";
     trans.child_frame_id = "_body";
@@ -1000,7 +989,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     trans.transform.rotation.z = geoQuat.z;
     tf_br->sendTransform(trans);
 
-    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "pitch: %f", pitch);
+    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "pitch: %f", pitch);
 
     geometry_msgs::msg::TransformStamped trans_body_yaw;
     trans_body_yaw.header.frame_id = "camera_init";
@@ -1494,6 +1483,21 @@ public:
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+        static_tf_broadcaster_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
+        {
+            geometry_msgs::msg::TransformStamped base_to_camera_init;
+            base_to_camera_init.header.stamp = rclcpp::Time(0, 0, this->get_clock()->get_clock_type());
+            base_to_camera_init.header.frame_id = "base";
+            base_to_camera_init.child_frame_id = "camera_init";
+            base_to_camera_init.transform.translation.x = 0.5;
+            base_to_camera_init.transform.translation.y = 0.0;
+            base_to_camera_init.transform.translation.z = 0.0;
+            base_to_camera_init.transform.rotation.w = 0.70710678;
+            base_to_camera_init.transform.rotation.x = 0.0;
+            base_to_camera_init.transform.rotation.y = 0.70710678;
+            base_to_camera_init.transform.rotation.z = 0.0;
+            static_tf_broadcaster_->sendTransform(base_to_camera_init);
+        }
         pubLaserCloudFull_fusion_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_lidar2_filtered", 20);  // 测试用：第二雷达裁剪+外参变换后的点云，在 timer 中发布
         pubLaserCloudRemoved_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_lidar2_removed", 20);      // 被滤掉的点云（后腿等），调试用
         
@@ -1723,6 +1727,7 @@ private:
     rclcpp::CallbackGroup::SharedPtr timer_callback_group_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+    std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
