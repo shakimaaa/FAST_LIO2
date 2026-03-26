@@ -869,9 +869,13 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.child_frame_id = "robot";
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
 
-    // 与 TF body_yaw、robot 一致：R_camera_init_robot = R_ci_body_yaw * R_body_yaw_robot
+    // IMU→robot 杆臂在 IMU 本体系（0.5m 沿 body -Z）；用完整 state_point.rot 旋到 camera_init，
+    // 避免欧拉 pitch + R_ci_by（仅含一轴）与滤波器四元数不一致时，robot 的 x/z 几乎不随俯仰变。
+    const double lever_norm = 0.5;
+    const Eigen::Vector3d lever_arm_body(0.0, 0.0, -lever_norm);
+    const Eigen::Matrix3d R_ci_b = state_point.rot.toRotationMatrix();
+
     double body_yaw_in_camera_init = 0.0;
-    double pitch = 0.0;
     {
         double qw = geoQuat.w;
         double qx = geoQuat.x;
@@ -880,16 +884,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         double sinr_cosp = 2.0 * (qw * qx + qy * qz);
         double cosr_cosp = 1.0 - 2.0 * (qx * qx + qy * qy);
         body_yaw_in_camera_init = std::atan2(sinr_cosp, cosr_cosp);
-        double sinp = 2.0 * (qw * qy - qz * qx);
-        if (std::abs(sinp) >= 1)
-            pitch = std::copysign(M_PI / 2, sinp);
-        else
-            pitch = std::asin(sinp);
-        if (std::cos(body_yaw_in_camera_init) < 0)
-            pitch = -pitch;
     }
-    const double offset_x = -0.5 * sin(pitch);
-    const double offset_z = -0.5 * cos(pitch);
 
     tf2::Quaternion q_ci_by;
     q_ci_by.setRPY(body_yaw_in_camera_init, 0.0, 0.0);
@@ -908,9 +903,8 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
             R_by_ro(r, c) = m_by_ro[r][c];
 
     const Eigen::Matrix3d R_ci_ro = R_ci_by * R_by_ro;
-    const Eigen::Vector3d t_by_ro(offset_x, 0.0, offset_z);
     const Eigen::Vector3d p_imu(state_point.pos(0), state_point.pos(1), state_point.pos(2));
-    const Eigen::Vector3d p_robot_ci = p_imu + R_ci_by * t_by_ro;
+    const Eigen::Vector3d p_robot_ci = p_imu + R_ci_b * lever_arm_body;
 
     odomAftMapped.pose.pose.position.x = p_robot_ci(0);
     odomAftMapped.pose.pose.position.y = p_robot_ci(1);
@@ -925,7 +919,6 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     }
 
     // 局部速度：robot 原点在世界系下的速度，再投影到 robot 轴（非世界系分量）
-    const Eigen::Matrix3d R_wb = state_point.rot.toRotationMatrix();
     Eigen::Vector3d omega_b(0.0, 0.0, 0.0);
     if (!Measures.imu.empty())
     {
@@ -934,8 +927,8 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
             im->angular_velocity.y - state_point.bg(1),
             im->angular_velocity.z - state_point.bg(2);
     }
-    const Eigen::Vector3d omega_w = R_wb * omega_b;
-    const Eigen::Vector3d delta_w = R_ci_by * t_by_ro;
+    const Eigen::Vector3d omega_w = R_ci_b * omega_b;
+    const Eigen::Vector3d delta_w = R_ci_b * lever_arm_body;
     const Eigen::Vector3d v_imu_w(state_point.vel(0), state_point.vel(1), state_point.vel(2));
     const Eigen::Vector3d v_robot_w = v_imu_w + omega_w.cross(delta_w);
     const Eigen::Vector3d v_robot = R_ci_ro.transpose() * v_robot_w;
@@ -976,6 +969,9 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     }
     pubOdomAftMapped->publish(odomAftMapped);
 
+    // base→camera_init 已在节点启动时经 StaticTransformBroadcaster 发布（/tf_static），
+    // 与 camera_init→robot 等按 lidar_end_time 的动态边组合时由 tf2 自动拼链。
+
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = "camera_init";
     trans.child_frame_id = "_body";
@@ -988,8 +984,6 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     trans.transform.rotation.y = geoQuat.y;
     trans.transform.rotation.z = geoQuat.z;
     tf_br->sendTransform(trans);
-
-    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "pitch: %f", pitch);
 
     geometry_msgs::msg::TransformStamped trans_body_yaw;
     trans_body_yaw.header.frame_id = "camera_init";
@@ -1004,20 +998,20 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     trans_body_yaw.transform.rotation.w = q_ci_by.w();
     tf_br->sendTransform(trans_body_yaw);
 
-    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "offset_x: %f, offset_z: %f", offset_x, offset_z);
-    // 发布 body_yaw -> robot
-    geometry_msgs::msg::TransformStamped trans_body_yaw_robot;
-    trans_body_yaw_robot.header.frame_id = "body_yaw";
-    trans_body_yaw_robot.child_frame_id = "robot";
-    trans_body_yaw_robot.header.stamp = get_ros_time(lidar_end_time);
-    trans_body_yaw_robot.transform.translation.x = offset_x;
-    trans_body_yaw_robot.transform.translation.y = 0.0;
-    trans_body_yaw_robot.transform.translation.z = offset_z;
-    trans_body_yaw_robot.transform.rotation.w = 0.70710678;
-    trans_body_yaw_robot.transform.rotation.x = 0.0;
-    trans_body_yaw_robot.transform.rotation.y = -0.70710678;
-    trans_body_yaw_robot.transform.rotation.z = 0.0;
-    tf_br->sendTransform(trans_body_yaw_robot);
+    // robot：相对 camera_init 的位姿（含 pitch 杆臂）；不再使用 body_yaw→robot
+    geometry_msgs::msg::TransformStamped trans_ci_robot;
+    trans_ci_robot.header.frame_id = "camera_init";
+    trans_ci_robot.child_frame_id = "robot";
+    trans_ci_robot.header.stamp = get_ros_time(lidar_end_time);
+    trans_ci_robot.transform.translation.x = p_robot_ci(0);
+    trans_ci_robot.transform.translation.y = p_robot_ci(1);
+    trans_ci_robot.transform.translation.z = p_robot_ci(2);
+    trans_ci_robot.transform.rotation.x = odomAftMapped.pose.pose.orientation.x;
+    trans_ci_robot.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
+    trans_ci_robot.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
+    trans_ci_robot.transform.rotation.w = odomAftMapped.pose.pose.orientation.w;
+    tf_br->sendTransform(trans_ci_robot);
+
     
     // 仅 Airy：body -> rslidar，用 Lidar-IMU 外参把 body 下的点云恢复到雷达“正”的坐标系
     if (any_lidar_is_airy())
@@ -1485,18 +1479,18 @@ public:
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
         static_tf_broadcaster_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
         {
-            geometry_msgs::msg::TransformStamped base_to_camera_init;
-            base_to_camera_init.header.stamp = rclcpp::Time(0, 0, this->get_clock()->get_clock_type());
-            base_to_camera_init.header.frame_id = "base";
-            base_to_camera_init.child_frame_id = "camera_init";
-            base_to_camera_init.transform.translation.x = 0.5;
-            base_to_camera_init.transform.translation.y = 0.0;
-            base_to_camera_init.transform.translation.z = 0.0;
-            base_to_camera_init.transform.rotation.w = 0.70710678;
-            base_to_camera_init.transform.rotation.x = 0.0;
-            base_to_camera_init.transform.rotation.y = 0.70710678;
-            base_to_camera_init.transform.rotation.z = 0.0;
-            static_tf_broadcaster_->sendTransform(base_to_camera_init);
+            geometry_msgs::msg::TransformStamped base_to_ci;
+            base_to_ci.header.stamp = rclcpp::Time(0, 0, this->get_clock()->get_clock_type());
+            base_to_ci.header.frame_id = "base";
+            base_to_ci.child_frame_id = "camera_init";
+            base_to_ci.transform.translation.x = 0.5;
+            base_to_ci.transform.translation.y = 0.0;
+            base_to_ci.transform.translation.z = 0.0;
+            base_to_ci.transform.rotation.w = 0.70710678;
+            base_to_ci.transform.rotation.x = 0.0;
+            base_to_ci.transform.rotation.y = 0.70710678;
+            base_to_ci.transform.rotation.z = 0.0;
+            static_tf_broadcaster_->sendTransform(base_to_ci);
         }
         pubLaserCloudFull_fusion_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_lidar2_filtered", 20);  // 测试用：第二雷达裁剪+外参变换后的点云，在 timer 中发布
         pubLaserCloudRemoved_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_lidar2_removed", 20);      // 被滤掉的点云（后腿等），调试用
