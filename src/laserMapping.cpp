@@ -335,7 +335,7 @@ void filter_rear_legs_lidar1(const PointCloudXYZI::Ptr& input,
     pcl::CropBox<PointType> crop_rl;
     crop_rl.setInputCloud(input_fixed);
     crop_rl.setMin(Eigen::Vector4f(-0.05f - margin,  0.15f,          -1.1f - margin, 1.0f));
-    crop_rl.setMax(Eigen::Vector4f( 0.82f + margin,  0.30f + margin, -0.80f + margin, 1.0f));
+    crop_rl.setMax(Eigen::Vector4f( 0.82f + margin,  0.30f + margin, -0.70f + margin, 1.0f));
     crop_rl.setNegative(true);
     crop_rl.filter(*tmp);
 
@@ -344,7 +344,7 @@ void filter_rear_legs_lidar1(const PointCloudXYZI::Ptr& input,
     pcl::CropBox<PointType> crop_rr;
     crop_rr.setInputCloud(tmp);
     crop_rr.setMin(Eigen::Vector4f(-0.05f - margin, -0.30f - margin, -1.1f - margin, 1.0f));
-    crop_rr.setMax(Eigen::Vector4f( 0.82f + margin, -0.15f,          -0.80f + margin, 1.0f));
+    crop_rr.setMax(Eigen::Vector4f( 0.82f + margin, -0.15f,          -0.70f + margin, 1.0f));
     crop_rr.setNegative(true);
     crop_rr.filter(*tmp2);
 
