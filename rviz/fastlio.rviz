@@ -6,8 +6,10 @@ Panels:
       Expanded:
         - /Global Options1
         - /Status1
+        - /TF1
         - /Odometry1
         - /GridMap1
+        - /PointCloud23
       Splitter Ratio: 0.5
     Tree Height: 774
   - Class: rviz_common/Selection
@@ -35,81 +37,81 @@ Visualization Manager:
       Enabled: true
       Frame Timeout: 15
       Frames:
-        All Enabled: true
+        All Enabled: false
         FL_calf:
-          Value: true
+          Value: false
         FL_foot:
-          Value: true
+          Value: false
         FL_hip:
-          Value: true
+          Value: false
         FL_thigh:
-          Value: true
+          Value: false
         FR_calf:
-          Value: true
+          Value: false
         FR_foot:
-          Value: true
+          Value: false
         FR_hip:
-          Value: true
+          Value: false
         FR_thigh:
-          Value: true
+          Value: false
         RL_calf:
-          Value: true
+          Value: false
         RL_foot:
-          Value: true
+          Value: false
         RL_hip:
-          Value: true
+          Value: false
         RL_thigh:
-          Value: true
+          Value: false
         RR_calf:
-          Value: true
+          Value: false
         RR_foot:
-          Value: true
+          Value: false
         RR_hip:
-          Value: true
+          Value: false
         RR_thigh:
-          Value: true
+          Value: false
         _body:
-          Value: true
+          Value: false
         base:
-          Value: true
+          Value: false
         base_link:
-          Value: true
+          Value: false
+        body_yaw:
+          Value: false
         camera_init:
-          Value: true
+          Value: false
         camera_link:
-          Value: true
+          Value: false
         d435i_depth_camera_imu_link:
-          Value: true
+          Value: false
         d435i_depth_link:
-          Value: true
+          Value: false
         d435i_infra1_link:
-          Value: true
+          Value: false
         d435i_infra2_link:
-          Value: true
+          Value: false
         fake_base:
-          Value: true
+          Value: false
         imu_link:
-          Value: true
+          Value: false
         lidar2_link:
-          Value: true
+          Value: false
+        lidar3_link:
+          Value: false
         lidar_link:
-          Value: true
-        mid360_2_imu_link:
-          Value: true
+          Value: false
         mid360_imu_link:
-          Value: true
+          Value: false
         mid360_lidar:
-          Value: true
+          Value: false
         mid360_lidar_2:
-          Value: true
+          Value: false
         odom:
-          Value: true
+          Value: false
         robot:
           Value: true
-        robot_yaw:
-          Value: true
         world:
-          Value: true
+          Value: false
       Marker Scale: 1
       Name: TF
       Show Arrows: true
@@ -120,9 +122,10 @@ Visualization Manager:
           camera_init:
             _body:
               {}
+            body_yaw:
+              {}
             robot:
-              robot_yaw:
-                {}
+              {}
       Update Interval: 0
       Value: true
     - Angle Tolerance: 0.10000000149011612
@@ -168,7 +171,7 @@ Visualization Manager:
       Buffer Length: 1
       Class: rviz_default_plugins/Path
       Color: 25; 255; 0
-      Enabled: true
+      Enabled: false
       Head Diameter: 0.30000001192092896
       Head Length: 0.20000000298023224
       Length: 0.30000001192092896
@@ -191,7 +194,7 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /path
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -238,7 +241,7 @@ Visualization Manager:
       Color: 255; 255; 255
       Color Transformer: Intensity
       Decay Time: 0
-      Enabled: true
+      Enabled: false
       Invert Rainbow: false
       Max Color: 255; 255; 255
       Max Intensity: 0
@@ -259,7 +262,7 @@ Visualization Manager:
         Value: /cloud_lidar2_filtered
       Use Fixed Frame: true
       Use rainbow: true
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -368,7 +371,7 @@ Visualization Manager:
       Color: 200; 200; 200
       Color Layer: inpaint
       Color Transformer: GridMapLayer
-      Enabled: true
+      Enabled: false
       Height Layer: inpaint
       Height Transformer: GridMapLayer
       History Length: 1
@@ -385,9 +388,55 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /elevation_mapping/filtered_elevation_map
+        Value: /elevation_mapping/body_elevation_map
       Use Rainbow: true
+      Value: false
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: -0.08459857106208801
+        Min Value: -0.4825441837310791
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/PointCloud2
+      Color: 255; 0; 0
+      Color Transformer: FlatColor
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: PointCloud2
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.009999999776482582
+      Style: Flat Squares
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /elevation_mapping/body_elevation_cloud
+      Use Fixed Frame: true
+      Use rainbow: true
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: false
+      Name: MarkerArray
+      Namespaces:
+        {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /elevation_mapping/body_elevation_cloud_indices
+      Value: false
   Enabled: true
   Global Options:
     Background Color: 0; 0; 0
@@ -434,25 +483,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 0.6028232574462891
+      Distance: 10.078746795654297
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.46106985211372375
-        Y: 0.953416109085083
-        Z: 0.6033116579055786
+        X: 0.3894155025482178
+        Y: -0.05371713638305664
+        Z: -0.31419339776039124
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.3597978353500366
+      Pitch: 1.33479642868042
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz_default_plugins)
-      Yaw: 1.3892046213150024
+      Yaw: 3.0842955112457275
     Saved: ~
 Window Geometry:
   Displays:
@@ -470,5 +519,5 @@ Window Geometry:
   Views:
     collapsed: false
   Width: 1193
-  X: 1309
-  Y: 115
+  X: 994
+  Y: 114

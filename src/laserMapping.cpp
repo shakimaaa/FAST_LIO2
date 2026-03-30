@@ -869,8 +869,8 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.child_frame_id = "robot";
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
 
-    // IMU→robot 杆臂在 IMU 本体系（0.5m 沿 body -Z）；用完整 state_point.rot 旋到 camera_init，
-    // 避免欧拉 pitch + R_ci_by（仅含一轴）与滤波器四元数不一致时，robot 的 x/z 几乎不随俯仰变。
+    // IMU→robot 杆臂在 IMU 本体系（0.5m 沿 body -Z）；用完整 state_point.rot（R_ci_b）变到 camera_init。
+    // robot 朝向：完整 R_ci_b 再右乘 R_by_ro（固定绕 Y 90°），不再用 R_ci_by 的单角近似。
     const double lever_norm = 0.5;
     const Eigen::Vector3d lever_arm_body(0.0, 0.0, -lever_norm);
     const Eigen::Matrix3d R_ci_b = state_point.rot.toRotationMatrix();
@@ -902,7 +902,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         for (int c = 0; c < 3; ++c)
             R_by_ro(r, c) = m_by_ro[r][c];
 
-    const Eigen::Matrix3d R_ci_ro = R_ci_by * R_by_ro;
+    const Eigen::Matrix3d R_ci_ro = R_ci_b * R_by_ro;
     const Eigen::Vector3d p_imu(state_point.pos(0), state_point.pos(1), state_point.pos(2));
     const Eigen::Vector3d p_robot_ci = p_imu + R_ci_b * lever_arm_body;
 
@@ -998,7 +998,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     trans_body_yaw.transform.rotation.w = q_ci_by.w();
     tf_br->sendTransform(trans_body_yaw);
 
-    // robot：相对 camera_init 的位姿（含 pitch 杆臂）；不再使用 body_yaw→robot
+    // robot：相对 camera_init 的位姿（杆臂 + 完整姿态 × R_by_ro）；body_yaw 仍为调试用单角系
     geometry_msgs::msg::TransformStamped trans_ci_robot;
     trans_ci_robot.header.frame_id = "camera_init";
     trans_ci_robot.child_frame_id = "robot";
