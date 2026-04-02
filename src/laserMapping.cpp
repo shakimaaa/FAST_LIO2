@@ -38,6 +38,7 @@
 #include <thread>
 #include <fstream>
 #include <csignal>
+#include <algorithm>
 #include <chrono>
 #include <unistd.h>
 #include <Python.h>
@@ -91,7 +92,11 @@ condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
-string lid_topic_2;
+string lid_topic_2, lid_topic_3;
+
+/** 总雷达数量 1~3（1=仅主雷达；2=主+一路辅雷；3=主+两路辅雷）。辅雷 topic / 类型见 multi.* */
+constexpr int kMaxAuxLidars = 2;
+int lidar_count = 1;
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -116,11 +121,13 @@ vector<double>       extrinR(9, 0.0);
 
 vector<double>       Lidar2_to_Lidar_T(3, 0.0);
 vector<double>       Lidar2_to_Lidar_R(9, 0.0);
-Eigen::Matrix<double, 3, 3> Lidar2_R_wrt_Lidar;
-Eigen::Matrix<double, 3, 1> Lidar2_T_wrt_Lidar;
+vector<double>       Lidar3_to_Lidar_T(3, 0.0);
+vector<double>       Lidar3_to_Lidar_R(9, 0.0);
+Eigen::Matrix3d Aux_R_wrt_primary[kMaxAuxLidars];
+Eigen::Vector3d Aux_T_wrt_primary[kMaxAuxLidars];
 deque<double>                     time_buffer;
 deque<PointCloudXYZI::Ptr>        lidar_buffer;
-deque<PointCloudXYZI::Ptr>        lidar_buffer_2; // second lidar buffer
+deque<PointCloudXYZI::Ptr>        lidar_buffer_aux[kMaxAuxLidars];
 deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
 
 PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
@@ -132,7 +139,7 @@ PointCloudXYZI::Ptr laserCloudOri(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr corr_normvect(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr _featsArray;
 PointCloudXYZI::Ptr lidar2_filtered_ptr(new PointCloudXYZI());
-PointCloudXYZI::Ptr lidar2_removed_cloud;  // 第二雷达被滤掉的点云（后腿等），用于调试发布
+PointCloudXYZI::Ptr lidar_aux_removed_cloud[kMaxAuxLidars];  // 各辅雷达被滤掉的点云（调试）
 
 pcl::VoxelGrid<PointType> downSizeFilterSurf;
 pcl::VoxelGrid<PointType> downSizeFilterMap;
@@ -158,14 +165,15 @@ geometry_msgs::msg::Quaternion geoQuat;
 geometry_msgs::msg::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
-/** 多雷达时第二路独立 preprocess，可与主雷达 lidar_type / 线数等不同 */
-shared_ptr<Preprocess> p_pre_2(new Preprocess());
+/** 辅雷达 preprocess[0]=第2雷达，[1]=第3雷达；仅 lidar_count 足够时创建 */
+shared_ptr<Preprocess> p_pre_aux[kMaxAuxLidars];
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
 
 static inline bool any_lidar_is_airy()
 {
     if (p_pre->lidar_type == AIRY) return true;
-    if (multi_en && p_pre_2->lidar_type == AIRY) return true;
+    for (int i = 0; i < lidar_count - 1 && i < kMaxAuxLidars; ++i)
+        if (p_pre_aux[i] && p_pre_aux[i]->lidar_type == AIRY) return true;
     return false;
 }
 
@@ -382,6 +390,26 @@ void filter_rear_legs_lidar1(const PointCloudXYZI::Ptr& input,
     }
 }
 
+/** aux_idx: 0 第二雷达, 1 第三雷达；点已在各自雷达系，此处变到主雷达系并入库 */
+static void push_aux_lidar_after_preprocess(PointCloudXYZI::Ptr lidar_ptr, int aux_idx)
+{
+    if (aux_idx < 0 || aux_idx >= kMaxAuxLidars || !lidar_ptr) return;
+    for (auto& point : lidar_ptr->points) {
+        Eigen::Vector3d pt_aux(point.x, point.y, point.z);
+        Eigen::Vector3d pt_pri = Aux_R_wrt_primary[aux_idx] * pt_aux + Aux_T_wrt_primary[aux_idx];
+        point.x = pt_pri(0);
+        point.y = pt_pri(1);
+        point.z = pt_pri(2);
+    }
+    PointCloudXYZI::Ptr filtered_ptr(new PointCloudXYZI());
+    filtered_ptr->points.reserve(lidar_ptr->points.size());
+    PointCloudXYZI::Ptr removed_ptr(new PointCloudXYZI());
+    filter_rear_legs_lidar1(lidar_ptr, filtered_ptr, removed_ptr);
+    std::lock_guard<std::mutex> lock(mtx_buffer);
+    lidar_buffer_aux[aux_idx].push_back(filtered_ptr);
+    lidar_aux_removed_cloud[aux_idx] = removed_ptr;
+}
+
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
     RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping"), "Standard PCL callback");
@@ -389,7 +417,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     scan_count ++;
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
-    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "time diff: %f", cur_time - last_timestamp_lidar);
+    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "time diff: %f", cur_time - last_timestamp_lidar);
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
@@ -419,7 +447,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
     scan_count ++;
-    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "time diff: %f", cur_time - last_timestamp_lidar);
+    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "time diff: %f", cur_time - last_timestamp_lidar);
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
@@ -453,40 +481,23 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     sig_buffer.notify_all();
 }
 
- void livox_pcl_cbk2(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg) 
- {
-    RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping"), "Lidar 2 callback");
+void livox_pcl_cbk2(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
+{
+    RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping"), "Lidar 2 (aux 0) Livox callback");
+    if (!p_pre_aux[0]) return;
+    PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
+    p_pre_aux[0]->process(msg, ptr);
+    push_aux_lidar_after_preprocess(ptr, 0);
+}
 
-    // 1. 点云处理与外参转换
-    
-    // 构造输出点云
-    PointCloudXYZI::Ptr lidar2_ptr(new PointCloudXYZI());
-    PointCloudXYZI::Ptr filtered_ptr(new PointCloudXYZI());
-    p_pre_2->process(msg, lidar2_ptr);
-
-    // 利用外参 (Lidar2_R_wrt_Lidar, Lidar2_T_wrt_Lidar) 将点云从雷达2坐标系变换到主雷达坐标系
-    for (auto& point : lidar2_ptr->points) {
-        Eigen::Vector3d pt_lidar2(point.x, point.y, point.z);
-        Eigen::Vector3d pt_lidar1 = Lidar2_R_wrt_Lidar * pt_lidar2 + Lidar2_T_wrt_Lidar;
-        point.x = pt_lidar1(0);
-        point.y = pt_lidar1(1);
-        point.z = pt_lidar1(2);
-    }
-
-    // 预分配空间（避免vector反复扩容）
-    filtered_ptr->points.reserve(lidar2_ptr->points.size());
-
-    PointCloudXYZI::Ptr removed_ptr(new PointCloudXYZI());
-    filter_rear_legs_lidar1(lidar2_ptr, filtered_ptr, removed_ptr);
-
-    {
-        std::lock_guard<std::mutex> lock(mtx_buffer);
-        lidar_buffer_2.push_back(filtered_ptr);
-        lidar2_removed_cloud = removed_ptr;
-    }
-
-    
- }
+void livox_pcl_cbk3(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
+{
+    RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping"), "Lidar 3 (aux 1) Livox callback");
+    if (!p_pre_aux[1]) return;
+    PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
+    p_pre_aux[1]->process(msg, ptr);
+    push_aux_lidar_after_preprocess(ptr, 1);
+}
 
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 {
@@ -523,29 +534,21 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 /** 第二路 PointCloud2（Velodyne / Ouster / MID360 等非 Livox CustomMsg） */
 void standard_pcl_cbk2(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 {
-    RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping"), "Lidar 2 standard PCL callback");
+    RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping"), "Lidar 2 (aux 0) standard PCL callback");
+    if (!p_pre_aux[0]) return;
+    PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
+    p_pre_aux[0]->process(msg, ptr);
+    push_aux_lidar_after_preprocess(ptr, 0);
+}
 
-    PointCloudXYZI::Ptr lidar2_ptr(new PointCloudXYZI());
-    PointCloudXYZI::Ptr filtered_ptr(new PointCloudXYZI());
-    p_pre_2->process(msg, lidar2_ptr);
-
-    for (auto& point : lidar2_ptr->points) {
-        Eigen::Vector3d pt_lidar2(point.x, point.y, point.z);
-        Eigen::Vector3d pt_lidar1 = Lidar2_R_wrt_Lidar * pt_lidar2 + Lidar2_T_wrt_Lidar;
-        point.x = pt_lidar1(0);
-        point.y = pt_lidar1(1);
-        point.z = pt_lidar1(2);
-    }
-
-    filtered_ptr->points.reserve(lidar2_ptr->points.size());
-    PointCloudXYZI::Ptr removed_ptr(new PointCloudXYZI());
-    filter_rear_legs_lidar1(lidar2_ptr, filtered_ptr, removed_ptr);
-
-    {
-        std::lock_guard<std::mutex> lock(mtx_buffer);
-        lidar_buffer_2.push_back(filtered_ptr);
-        lidar2_removed_cloud = removed_ptr;
-    }
+/** 第三路 PointCloud2 */
+void standard_pcl_cbk3(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
+{
+    RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping"), "Lidar 3 (aux 1) standard PCL callback");
+    if (!p_pre_aux[1]) return;
+    PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
+    p_pre_aux[1]->process(msg, ptr);
+    push_aux_lidar_after_preprocess(ptr, 1);
 }
 
 double lidar_mean_scantime = 0.0;
@@ -722,25 +725,31 @@ void publish_frame_body_fusion(
     // 1. 主雷达当前帧（主雷达坐标系）
     int size_main = feats_undistort->points.size();
 
-    // 2. 取第二雷达最新一帧（已经在 livox_pcl_cbk2 中变到主雷达坐标系）
-    PointCloudXYZI::Ptr lidar2_cloud(new PointCloudXYZI());
+    // 2. 各辅雷达最新一帧（已在回调中变到主雷达坐标系）
+    PointCloudXYZI::Ptr aux_latest[kMaxAuxLidars];
     {
         std::lock_guard<std::mutex> lock(mtx_buffer);
-        if (!lidar_buffer_2.empty()) {
-            lidar2_cloud = lidar_buffer_2.back();
+        for (int a = 0; a < lidar_count - 1 && a < kMaxAuxLidars; ++a) {
+            if (!lidar_buffer_aux[a].empty())
+                aux_latest[a] = lidar_buffer_aux[a].back();
         }
     }
 
+    size_t extra_pts = 0;
+    for (int a = 0; a < lidar_count - 1 && a < kMaxAuxLidars; ++a)
+        if (aux_latest[a]) extra_pts += aux_latest[a]->size();
+
     // 3. 先在主雷达坐标系下融合
     PointCloudXYZI::Ptr fusion_lidar(new PointCloudXYZI());
-    fusion_lidar->reserve(size_main + (lidar2_cloud ? lidar2_cloud->size() : 0));
+    fusion_lidar->reserve(size_main + extra_pts);
 
     if (!feats_undistort->empty()) {
         *fusion_lidar += *feats_undistort;
     }
 
-    if (lidar2_cloud && !lidar2_cloud->empty()) {
-        *fusion_lidar += *lidar2_cloud;
+    for (int a = 0; a < lidar_count - 1 && a < kMaxAuxLidars; ++a) {
+        if (aux_latest[a] && !aux_latest[a]->empty())
+            *fusion_lidar += *aux_latest[a];
     }
 
     if (fusion_lidar->empty()) {
@@ -765,11 +774,15 @@ void publish_lidar2_removed(
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_lidar2_removed)
 {
     if (!pub_lidar2_removed) return;
-    PointCloudXYZI::Ptr removed;
+    PointCloudXYZI::Ptr merged(new PointCloudXYZI());
     {
         std::lock_guard<std::mutex> lock(mtx_buffer);
-        removed = lidar2_removed_cloud;
+        for (int a = 0; a < lidar_count - 1 && a < kMaxAuxLidars; ++a) {
+            if (lidar_aux_removed_cloud[a] && !lidar_aux_removed_cloud[a]->empty())
+                *merged += *lidar_aux_removed_cloud[a];
+        }
     }
+    PointCloudXYZI::Ptr removed = merged;
     if (!removed || removed->empty()) return;
     PointCloudXYZI::Ptr removed_body(new PointCloudXYZI(removed->size(), 1));
     for (size_t i = 0; i < removed->points.size(); ++i)
@@ -795,7 +808,7 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = any_lidar_is_airy() ? "rslidar" : "_body";
+    laserCloudmsg.header.frame_id = "_body";
     pubLaserCloudFull_body->publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
 }
@@ -871,7 +884,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
 
     // IMU→robot 杆臂在 IMU 本体系（0.5m 沿 body -Z）；用完整 state_point.rot（R_ci_b）变到 camera_init。
     // robot 朝向：完整 R_ci_b 再右乘 R_by_ro（固定绕 Y 90°），不再用 R_ci_by 的单角近似。
-    const double lever_norm = 0.5;
+    const double lever_norm = 0.48;
     const Eigen::Vector3d lever_arm_body(0.0, 0.0, -lever_norm);
     const Eigen::Matrix3d R_ci_b = state_point.rot.toRotationMatrix();
 
@@ -1207,15 +1220,25 @@ public:
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
+        /* multi：辅雷达与主雷达（common.lid_topic）外参对齐；EKF 仍只由主雷达帧驱动 */
         this->declare_parameter<bool>("multi.multi_en", false);
+        /** -1=自动：multi_en 为 false→1，true→2；否则钳位到 1~3 */
+        this->declare_parameter<int>("multi.lidar_count", -1);
         this->declare_parameter<string>("multi.lid_topic_2", "/livox/lidar_2");
+        this->declare_parameter<string>("multi.lid_topic_3", "/livox/lidar_3");
         this->declare_parameter<vector<double>>("multi.Lidar2_to_Lidar_T", vector<double>());
         this->declare_parameter<vector<double>>("multi.Lidar2_to_Lidar_R", vector<double>());
+        this->declare_parameter<vector<double>>("multi.Lidar3_to_Lidar_T", vector<double>());
+        this->declare_parameter<vector<double>>("multi.Lidar3_to_Lidar_R", vector<double>());
         this->declare_parameter<bool>("multi.removed_en", false);
-        this->declare_parameter<int>("multi.lidar_type", -1);   // -1: 与 preprocess.lidar_type 相同
+        this->declare_parameter<int>("multi.lidar_type", -1);   // -1: 与 preprocess.lidar_type 相同（第2雷达）
         this->declare_parameter<int>("multi.scan_line", -1);    // -1: 与主雷达 N_SCANS 相同
         this->declare_parameter<int>("multi.timestamp_unit", -1); // -1: 与主雷达 time_unit 相同
         this->declare_parameter<int>("multi.scan_rate", -1);     // -1: 与主雷达 SCAN_RATE 相同
+        this->declare_parameter<int>("multi.lidar_type_3", -1);   // 第3雷达；-1 表示与主雷达相同
+        this->declare_parameter<int>("multi.scan_line_3", -1);
+        this->declare_parameter<int>("multi.timestamp_unit_3", -1);
+        this->declare_parameter<int>("multi.scan_rate_3", -1);
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -1253,33 +1276,87 @@ public:
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
-        this->get_parameter_or<bool>("multi.multi_en", multi_en, false);    
+        this->get_parameter_or<bool>("multi.multi_en", multi_en, false);
+        int lidar_count_param = -1;
+        this->get_parameter_or<int>("multi.lidar_count", lidar_count_param, -1);
+        if (lidar_count_param < 0)
+            lidar_count = multi_en ? 2 : 1;
+        else
+            lidar_count = std::max(1, std::min(3, lidar_count_param));
+        /* 与 lidar_count 对齐：显式 lidar_count:1 会关闭辅路，即使曾写 multi_en: true */
+        multi_en = (lidar_count >= 2);
+
         this->get_parameter_or<string>("multi.lid_topic_2", lid_topic_2, "/livox/lidar_2");
+        this->get_parameter_or<string>("multi.lid_topic_3", lid_topic_3, "/livox/lidar_3");
         this->get_parameter_or<vector<double>>("multi.Lidar2_to_Lidar_T", Lidar2_to_Lidar_T, vector<double>());
         this->get_parameter_or<vector<double>>("multi.Lidar2_to_Lidar_R", Lidar2_to_Lidar_R, vector<double>());
+        this->get_parameter_or<vector<double>>("multi.Lidar3_to_Lidar_T", Lidar3_to_Lidar_T, vector<double>());
+        this->get_parameter_or<vector<double>>("multi.Lidar3_to_Lidar_R", Lidar3_to_Lidar_R, vector<double>());
         this->get_parameter_or<bool>("multi.removed_en", removed_en, false);
 
-        // 第二路 preprocess：默认与主雷达一致，multi.* 可单独覆盖（支持异构雷达）
-        p_pre_2->blind = p_pre->blind;
-        p_pre_2->point_filter_num = p_pre->point_filter_num;
-        p_pre_2->N_SCANS = p_pre->N_SCANS;
-        p_pre_2->SCAN_RATE = p_pre->SCAN_RATE;
-        p_pre_2->time_unit = p_pre->time_unit;
-        p_pre_2->feature_enabled = p_pre->feature_enabled;
-        p_pre_2->given_offset_time = p_pre->given_offset_time;
-        {
+        auto init_aux_preprocess_base = [this](const std::shared_ptr<Preprocess>& pp) {
+            pp->blind = p_pre->blind;
+            pp->point_filter_num = p_pre->point_filter_num;
+            pp->N_SCANS = p_pre->N_SCANS;
+            pp->SCAN_RATE = p_pre->SCAN_RATE;
+            pp->time_unit = p_pre->time_unit;
+            pp->feature_enabled = p_pre->feature_enabled;
+            pp->given_offset_time = p_pre->given_offset_time;
+        };
+
+        for (int i = 0; i < lidar_count - 1 && i < kMaxAuxLidars; ++i) {
+            p_pre_aux[i] = std::make_shared<Preprocess>();
+            init_aux_preprocess_base(p_pre_aux[i]);
+        }
+
+        // 第2雷达 preprocess：multi.lidar_type / scan_line 等覆盖
+        if (lidar_count >= 2) {
             int multi_lidar_type = -1;
             this->get_parameter_or<int>("multi.lidar_type", multi_lidar_type, -1);
-            p_pre_2->lidar_type = (multi_lidar_type >= 0) ? multi_lidar_type : p_pre->lidar_type;
+            p_pre_aux[0]->lidar_type = (multi_lidar_type >= 0) ? multi_lidar_type : p_pre->lidar_type;
             int multi_scan_line = -1;
             this->get_parameter_or<int>("multi.scan_line", multi_scan_line, -1);
-            if (multi_scan_line > 0) p_pre_2->N_SCANS = multi_scan_line;
+            if (multi_scan_line > 0) p_pre_aux[0]->N_SCANS = multi_scan_line;
             int multi_tu = -1;
             this->get_parameter_or<int>("multi.timestamp_unit", multi_tu, -1);
-            if (multi_tu >= 0) p_pre_2->time_unit = multi_tu;
+            if (multi_tu >= 0) p_pre_aux[0]->time_unit = multi_tu;
             int multi_sr = -1;
             this->get_parameter_or<int>("multi.scan_rate", multi_sr, -1);
-            if (multi_sr > 0) p_pre_2->SCAN_RATE = multi_sr;
+            if (multi_sr > 0) p_pre_aux[0]->SCAN_RATE = multi_sr;
+        }
+
+        // 第3雷达 preprocess
+        if (lidar_count >= 3) {
+            int lt3 = -1;
+            this->get_parameter_or<int>("multi.lidar_type_3", lt3, -1);
+            p_pre_aux[1]->lidar_type = (lt3 >= 0) ? lt3 : p_pre->lidar_type;
+            int sl3 = -1;
+            this->get_parameter_or<int>("multi.scan_line_3", sl3, -1);
+            if (sl3 > 0) p_pre_aux[1]->N_SCANS = sl3;
+            int tu3 = -1;
+            this->get_parameter_or<int>("multi.timestamp_unit_3", tu3, -1);
+            if (tu3 >= 0) p_pre_aux[1]->time_unit = tu3;
+            int sr3 = -1;
+            this->get_parameter_or<int>("multi.scan_rate_3", sr3, -1);
+            if (sr3 > 0) p_pre_aux[1]->SCAN_RATE = sr3;
+        }
+
+        if (lidar_count >= 3 &&
+            (Lidar3_to_Lidar_T.size() < 3 || Lidar3_to_Lidar_R.size() < 9))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                "lidar_count>=3 但 multi.Lidar3_to_Lidar_T/R 未填满（需 3 与 9 元素），外参将退化为平移 0 + 单位旋转");
+        }
+
+        if (lidar_count >= 2 && p_pre_aux[0])
+        {
+            RCLCPP_INFO(this->get_logger(),
+                "Multi-LiDAR: lidar_count=%d；辅路0 topic=%s preprocess_type=%d",
+                lidar_count, lid_topic_2.c_str(), p_pre_aux[0]->lidar_type);
+            if (lidar_count >= 3 && p_pre_aux[1])
+                RCLCPP_INFO(this->get_logger(),
+                    "Multi-LiDAR: 辅路1 topic=%s preprocess_type=%d",
+                    lid_topic_3.c_str(), p_pre_aux[1]->lidar_type);
         }
 
         if (debug_info)
@@ -1328,14 +1405,23 @@ public:
             RCLCPP_INFO(this->get_logger(), "%spcd_save_en%s: %s%s%s", COLOR_ITEM, COLOR_RESET, pcd_save_en ? COLOR_BOOL_ON : COLOR_BOOL_OFF, pcd_save_en ? "true" : "false", COLOR_RESET);
             RCLCPP_INFO(this->get_logger(), "%spcd_save_interval%s: %s%d%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, pcd_save_interval, COLOR_RESET);
             RCLCPP_INFO(this->get_logger(), "%smulti_en%s: %s%s%s", COLOR_ITEM, COLOR_RESET, multi_en ? COLOR_BOOL_ON : COLOR_BOOL_OFF, multi_en ? "true" : "false", COLOR_RESET);
+            RCLCPP_INFO(this->get_logger(), "%slidar_count%s: %s%d%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, lidar_count, COLOR_RESET);
             RCLCPP_INFO(this->get_logger(), "%slid_topic_2%s: %s%s%s", COLOR_ITEM, COLOR_RESET, COLOR_STRING, lid_topic_2.c_str(), COLOR_RESET);
+            RCLCPP_INFO(this->get_logger(), "%slid_topic_3%s: %s%s%s", COLOR_ITEM, COLOR_RESET, COLOR_STRING, lid_topic_3.c_str(), COLOR_RESET);
             RCLCPP_INFO(this->get_logger(), "%sremoved_en%s: %s%s%s", COLOR_ITEM, COLOR_RESET, removed_en ? COLOR_BOOL_ON : COLOR_BOOL_OFF, removed_en ? "true" : "false", COLOR_RESET);
-            if (multi_en)
+            if (lidar_count >= 2 && p_pre_aux[0])
             {
-                RCLCPP_INFO(this->get_logger(), "%sp_pre_2->lidar_type%s: %s%d%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, p_pre_2->lidar_type, COLOR_RESET);
-                RCLCPP_INFO(this->get_logger(), "%sp_pre_2->N_SCANS%s: %s%d%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, p_pre_2->N_SCANS, COLOR_RESET);
-                RCLCPP_INFO(this->get_logger(), "%sp_pre_2->time_unit%s: %s%d%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, p_pre_2->time_unit, COLOR_RESET);
-                RCLCPP_INFO(this->get_logger(), "%sp_pre_2->SCAN_RATE%s: %s%d%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, p_pre_2->SCAN_RATE, COLOR_RESET);
+                RCLCPP_INFO(this->get_logger(), "%spre aux0 lidar_type%s: %s%d%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, p_pre_aux[0]->lidar_type, COLOR_RESET);
+                RCLCPP_INFO(this->get_logger(), "%spre aux0 N_SCANS%s: %s%d%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, p_pre_aux[0]->N_SCANS, COLOR_RESET);
+                RCLCPP_INFO(this->get_logger(), "%spre aux0 time_unit%s: %s%d%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, p_pre_aux[0]->time_unit, COLOR_RESET);
+                RCLCPP_INFO(this->get_logger(), "%spre aux0 SCAN_RATE%s: %s%d%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, p_pre_aux[0]->SCAN_RATE, COLOR_RESET);
+            }
+            if (lidar_count >= 3 && p_pre_aux[1])
+            {
+                RCLCPP_INFO(this->get_logger(), "%spre aux1 lidar_type%s: %s%d%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, p_pre_aux[1]->lidar_type, COLOR_RESET);
+                RCLCPP_INFO(this->get_logger(), "%spre aux1 N_SCANS%s: %s%d%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, p_pre_aux[1]->N_SCANS, COLOR_RESET);
+                RCLCPP_INFO(this->get_logger(), "%spre aux1 time_unit%s: %s%d%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, p_pre_aux[1]->time_unit, COLOR_RESET);
+                RCLCPP_INFO(this->get_logger(), "%spre aux1 SCAN_RATE%s: %s%d%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, p_pre_aux[1]->SCAN_RATE, COLOR_RESET);
             }
             
 
@@ -1364,15 +1450,31 @@ public:
                 if(i!=Lidar2_to_Lidar_T.size()-1) ssT2 << ", ";
             }
             ssT2 << "]";
-            RCLCPP_INFO(this->get_logger(), "%sLidar2_to_Lidar_T%s: %s%s%s", COLOR_ITEM, COLOR_RESET, COLOR_STRING, ssT.str().c_str(), COLOR_RESET);
+            RCLCPP_INFO(this->get_logger(), "%sLidar2_to_Lidar_T%s: %s%s%s", COLOR_ITEM, COLOR_RESET, COLOR_STRING, ssT2.str().c_str(), COLOR_RESET);
             
             ssR2 << "[";
             for(size_t i=0; i<Lidar2_to_Lidar_R.size(); ++i){
-                ssR << Lidar2_to_Lidar_R[i];
-                if(i!=Lidar2_to_Lidar_R.size()-1) ssR << ", ";
+                ssR2 << Lidar2_to_Lidar_R[i];
+                if(i!=Lidar2_to_Lidar_R.size()-1) ssR2 << ", ";
             }
             ssR2 << "]";
-            RCLCPP_INFO(this->get_logger(), "%sLidar2_to_Lidar_R%s: %s%s%s", COLOR_ITEM, COLOR_RESET, COLOR_STRING, ssR.str().c_str(), COLOR_RESET);
+            RCLCPP_INFO(this->get_logger(), "%sLidar2_to_Lidar_R%s: %s%s%s", COLOR_ITEM, COLOR_RESET, COLOR_STRING, ssR2.str().c_str(), COLOR_RESET);
+
+            std::stringstream ssT3, ssR3;
+            ssT3 << "[";
+            for (size_t i = 0; i < Lidar3_to_Lidar_T.size(); ++i) {
+                ssT3 << Lidar3_to_Lidar_T[i];
+                if (i + 1 < Lidar3_to_Lidar_T.size()) ssT3 << ", ";
+            }
+            ssT3 << "]";
+            RCLCPP_INFO(this->get_logger(), "%sLidar3_to_Lidar_T%s: %s%s%s", COLOR_ITEM, COLOR_RESET, COLOR_STRING, ssT3.str().c_str(), COLOR_RESET);
+            ssR3 << "[";
+            for (size_t i = 0; i < Lidar3_to_Lidar_R.size(); ++i) {
+                ssR3 << Lidar3_to_Lidar_R[i];
+                if (i + 1 < Lidar3_to_Lidar_R.size()) ssR3 << ", ";
+            }
+            ssR3 << "]";
+            RCLCPP_INFO(this->get_logger(), "%sLidar3_to_Lidar_R%s: %s%s%s", COLOR_ITEM, COLOR_RESET, COLOR_STRING, ssR3.str().c_str(), COLOR_RESET);
 
             RCLCPP_INFO(this->get_logger(), "%s============== END PARAMS ==============%s", COLOR_HEAD, COLOR_RESET);
         }
@@ -1405,8 +1507,25 @@ public:
         p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
         p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
 
-        Lidar2_R_wrt_Lidar = Eigen::Map<Eigen::Matrix<double, 3, 3, Eigen::RowMajor>>(Lidar2_to_Lidar_R.data());
-        Lidar2_T_wrt_Lidar = Eigen::Map<Eigen::Matrix<double, 3, 1>>(Lidar2_to_Lidar_T.data());
+        auto load_aux_extrinsic = [this](int idx, const vector<double>& Tv, const vector<double>& Rv, const char* name) {
+            if (static_cast<size_t>(idx) >= kMaxAuxLidars) return;
+            if (Tv.size() >= 3)
+                Aux_T_wrt_primary[idx] = Eigen::Vector3d(Tv[0], Tv[1], Tv[2]);
+            else {
+                Aux_T_wrt_primary[idx].setZero();
+                RCLCPP_WARN(this->get_logger(), "%s: T invalid, using zeros", name);
+            }
+            if (Rv.size() >= 9)
+                Aux_R_wrt_primary[idx] = Eigen::Map<const Eigen::Matrix<double, 3, 3, Eigen::RowMajor>>(Rv.data());
+            else {
+                Aux_R_wrt_primary[idx].setIdentity();
+                RCLCPP_WARN(this->get_logger(), "%s: R invalid, using identity", name);
+            }
+        };
+        if (lidar_count >= 2)
+            load_aux_extrinsic(0, Lidar2_to_Lidar_T, Lidar2_to_Lidar_R, "Lidar2_to_Lidar");
+        if (lidar_count >= 3)
+            load_aux_extrinsic(1, Lidar3_to_Lidar_T, Lidar3_to_Lidar_R, "Lidar3_to_Lidar");
 
         fill(epsi, epsi+23, 0.001);
         kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
@@ -1429,26 +1548,33 @@ public:
         // Callback Group
         imu_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         pcl_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        pcl_callback_group_2 = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        pcl_callback_group_3 = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         pcl_livoxcallback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         pcl_livoxcallback_group_2 = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        pcl_livoxcallback_group_3 = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         timer_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
         rclcpp::SubscriptionOptions pcl_options;
             pcl_options.callback_group = pcl_callback_group_;
         rclcpp::SubscriptionOptions pcl_options_2;
             pcl_options_2.callback_group = pcl_callback_group_2;
+        rclcpp::SubscriptionOptions pcl_options_3;
+            pcl_options_3.callback_group = pcl_callback_group_3;
         rclcpp::SubscriptionOptions pcl_livox_options;
             pcl_livox_options.callback_group = pcl_livoxcallback_group_;
         rclcpp::SubscriptionOptions pcl_livox_options_2;
             pcl_livox_options_2.callback_group = pcl_livoxcallback_group_2;
+        rclcpp::SubscriptionOptions pcl_livox_options_3;
+            pcl_livox_options_3.callback_group = pcl_livoxcallback_group_3;
         rclcpp::SubscriptionOptions imu_options;
             imu_options.callback_group = imu_callback_group_;
         // rclcpp::SubscriptionOptions timer_options;
         //     timer_options.callback_group = timer_callback_group_;
 
-        if (multi_en)
+        if (lidar_count >= 2 && p_pre_aux[0])
         {
-            if (p_pre_2->lidar_type == AVIA)
+            if (p_pre_aux[0]->lidar_type == AVIA)
             {
                 sub_pcl_livox_2_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(
                     lid_topic_2, 20, livox_pcl_cbk2, pcl_livox_options_2);
@@ -1457,6 +1583,19 @@ public:
             {
                 sub_pcl_pc_2_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
                     lid_topic_2, rclcpp::SensorDataQoS(), standard_pcl_cbk2, pcl_options_2);
+            }
+        }
+        if (lidar_count >= 3 && p_pre_aux[1])
+        {
+            if (p_pre_aux[1]->lidar_type == AVIA)
+            {
+                sub_pcl_livox_3_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(
+                    lid_topic_3, 20, livox_pcl_cbk3, pcl_livox_options_3);
+            }
+            else
+            {
+                sub_pcl_pc_3_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+                    lid_topic_3, rclcpp::SensorDataQoS(), standard_pcl_cbk3, pcl_options_3);
             }
         }
         if (p_pre->lidar_type == AVIA)
@@ -1483,9 +1622,9 @@ public:
             base_to_ci.header.stamp = rclcpp::Time(0, 0, this->get_clock()->get_clock_type());
             base_to_ci.header.frame_id = "base";
             base_to_ci.child_frame_id = "camera_init";
-            base_to_ci.transform.translation.x = 0.5;
+            base_to_ci.transform.translation.x = 0.482;
             base_to_ci.transform.translation.y = 0.0;
-            base_to_ci.transform.translation.z = 0.0;
+            base_to_ci.transform.translation.z = 0.0453;
             base_to_ci.transform.rotation.w = 0.70710678;
             base_to_ci.transform.rotation.x = 0.0;
             base_to_ci.transform.rotation.y = 0.70710678;
@@ -1637,7 +1776,7 @@ private:
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
             // 第二雷达裁剪+外参变换后的点云（测试过滤），与其它点云一起在 timer 中发布
-            if (multi_en) {
+            if (lidar_count >= 2) {
                 publish_frame_body_fusion(pubLaserCloudFull_fusion_);
                 if (removed_en)
                     publish_lidar2_removed(pubLaserCloudRemoved_);
@@ -1711,13 +1850,17 @@ private:
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_2_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_2_;
+    rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_3_;
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_3_;
 
     // Callback Group
     rclcpp::CallbackGroup::SharedPtr imu_callback_group_;
     rclcpp::CallbackGroup::SharedPtr pcl_callback_group_;
     rclcpp::CallbackGroup::SharedPtr pcl_callback_group_2;
+    rclcpp::CallbackGroup::SharedPtr pcl_callback_group_3;
     rclcpp::CallbackGroup::SharedPtr pcl_livoxcallback_group_;
     rclcpp::CallbackGroup::SharedPtr pcl_livoxcallback_group_2;
+    rclcpp::CallbackGroup::SharedPtr pcl_livoxcallback_group_3;
     rclcpp::CallbackGroup::SharedPtr timer_callback_group_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
