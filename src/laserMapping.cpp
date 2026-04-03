@@ -35,6 +35,7 @@
 #include <omp.h>
 #include <mutex>
 #include <math.h>
+#include <cmath>
 #include <thread>
 #include <fstream>
 #include <csignal>
@@ -125,9 +126,20 @@ vector<double>       Lidar3_to_Lidar_T(3, 0.0);
 vector<double>       Lidar3_to_Lidar_R(9, 0.0);
 Eigen::Matrix3d Aux_R_wrt_primary[kMaxAuxLidars];
 Eigen::Vector3d Aux_T_wrt_primary[kMaxAuxLidars];
+/** 辅路点云帧：cloud 已在主雷达系；stamp_sec 为原始消息 header 时间（秒），用于与主帧 lidar_end_time 配对 */
+struct AuxLidarFrame {
+    PointCloudXYZI::Ptr cloud;
+    double stamp_sec{0.0};
+};
 deque<double>                     time_buffer;
 deque<PointCloudXYZI::Ptr>        lidar_buffer;
-deque<PointCloudXYZI::Ptr>        lidar_buffer_aux[kMaxAuxLidars];
+deque<AuxLidarFrame>            lidar_buffer_aux[kMaxAuxLidars];
+/** 辅帧时间与 lidar_end_time 最大允许偏差（秒）。<=0 表示不丢弃，仅取最接近的一帧 */
+double aux_time_sync_max_diff = -1.0;
+/** 每路辅雷达缓冲区最大帧数，超出则从队首丢弃 */
+int aux_buffer_max_size = 32;
+/** 打印「辅帧 header − lidar_end_time」的节流周期（毫秒）；0 表示不打印 */
+int aux_sync_time_log_ms = 1000;
 deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
 
 PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
@@ -143,6 +155,9 @@ PointCloudXYZI::Ptr lidar_aux_removed_cloud[kMaxAuxLidars];  // 各辅雷达被�
 
 pcl::VoxelGrid<PointType> downSizeFilterSurf;
 pcl::VoxelGrid<PointType> downSizeFilterMap;
+/** 第2/3路雷达体素下采样（米）；<=0 关闭，在节点构造时按参数写入 */
+pcl::VoxelGrid<PointType> downSizeFilterAux[kMaxAuxLidars];
+double filter_size_aux_voxel[kMaxAuxLidars];
 
 KD_TREE<PointType> ikdtree;
 
@@ -390,10 +405,22 @@ void filter_rear_legs_lidar1(const PointCloudXYZI::Ptr& input,
     }
 }
 
-/** aux_idx: 0 第二雷达, 1 第三雷达；点已在各自雷达系，此处变到主雷达系并入库 */
-static void push_aux_lidar_after_preprocess(PointCloudXYZI::Ptr lidar_ptr, int aux_idx)
+/** 辅路点云体素下采样：preprocess 输出后、外参变换到主雷达前（尽早减点）；filter_size_aux_voxel<=0 跳过 */
+static void downsample_aux_pointcloud(PointCloudXYZI::Ptr& cloud, int aux_idx)
+{
+    if (aux_idx < 0 || aux_idx >= kMaxAuxLidars || !cloud || cloud->empty()) return;
+    if (filter_size_aux_voxel[aux_idx] <= 0.0) return;
+    PointCloudXYZI::Ptr out(new PointCloudXYZI());
+    downSizeFilterAux[aux_idx].setInputCloud(cloud);
+    downSizeFilterAux[aux_idx].filter(*out);
+    cloud = out;
+}
+
+/** aux_idx: 0 第二雷达, 1 第三雷达；点已在各自雷达系，此处变到主雷达系并入库。header_stamp_sec 为消息头时间戳（秒） */
+static void push_aux_lidar_after_preprocess(PointCloudXYZI::Ptr lidar_ptr, int aux_idx, double header_stamp_sec)
 {
     if (aux_idx < 0 || aux_idx >= kMaxAuxLidars || !lidar_ptr) return;
+    downsample_aux_pointcloud(lidar_ptr, aux_idx);
     for (auto& point : lidar_ptr->points) {
         Eigen::Vector3d pt_aux(point.x, point.y, point.z);
         Eigen::Vector3d pt_pri = Aux_R_wrt_primary[aux_idx] * pt_aux + Aux_T_wrt_primary[aux_idx];
@@ -406,8 +433,47 @@ static void push_aux_lidar_after_preprocess(PointCloudXYZI::Ptr lidar_ptr, int a
     PointCloudXYZI::Ptr removed_ptr(new PointCloudXYZI());
     filter_rear_legs_lidar1(lidar_ptr, filtered_ptr, removed_ptr);
     std::lock_guard<std::mutex> lock(mtx_buffer);
-    lidar_buffer_aux[aux_idx].push_back(filtered_ptr);
+    lidar_buffer_aux[aux_idx].push_back(AuxLidarFrame{filtered_ptr, header_stamp_sec});
+    while (aux_buffer_max_size > 0 &&
+           static_cast<int>(lidar_buffer_aux[aux_idx].size()) > aux_buffer_max_size) {
+        lidar_buffer_aux[aux_idx].pop_front();
+    }
     lidar_aux_removed_cloud[aux_idx] = removed_ptr;
+}
+
+/** 与 lidar_end_time 配对的辅帧结果（须在已持有 mtx_buffer 下调用 aux_closest_pick） */
+struct AuxPickResult {
+    PointCloudXYZI::Ptr cloud{nullptr};
+    double aux_stamp_sec{0.0};
+    double signed_dt{0.0}; /**< 辅帧 header 时间 − t_ref（秒），正=辅帧偏晚 */
+    bool has_candidate{false};
+    bool rejected{false};  /**< 因 |dt|>aux_time_sync_max_diff 丢弃 */
+};
+
+/** 在缓冲区中选与 t_ref（通常为 lidar_end_time）时间最接近的辅帧；若 aux_time_sync_max_diff>0 且 |dt| 超限则 cloud 为空 */
+static AuxPickResult aux_closest_pick(int aux_idx, double t_ref)
+{
+    AuxPickResult r;
+    if (aux_idx < 0 || aux_idx >= kMaxAuxLidars || lidar_buffer_aux[aux_idx].empty())
+        return r;
+    size_t best_i = 0;
+    double best_abs = std::fabs(lidar_buffer_aux[aux_idx][0].stamp_sec - t_ref);
+    for (size_t i = 1; i < lidar_buffer_aux[aux_idx].size(); ++i) {
+        const double dt = std::fabs(lidar_buffer_aux[aux_idx][i].stamp_sec - t_ref);
+        if (dt < best_abs) {
+            best_abs = dt;
+            best_i = i;
+        }
+    }
+    r.has_candidate = true;
+    r.aux_stamp_sec = lidar_buffer_aux[aux_idx][best_i].stamp_sec;
+    r.signed_dt = r.aux_stamp_sec - t_ref;
+    if (aux_time_sync_max_diff > 0.0 && best_abs > aux_time_sync_max_diff) {
+        r.rejected = true;
+        return r;
+    }
+    r.cloud = lidar_buffer_aux[aux_idx][best_i].cloud;
+    return r;
 }
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
@@ -485,18 +551,20 @@ void livox_pcl_cbk2(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 {
     RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping"), "Lidar 2 (aux 0) Livox callback");
     if (!p_pre_aux[0]) return;
+    const double hdr_t = get_time_sec(msg->header.stamp);
     PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
     p_pre_aux[0]->process(msg, ptr);
-    push_aux_lidar_after_preprocess(ptr, 0);
+    push_aux_lidar_after_preprocess(ptr, 0, hdr_t);
 }
 
 void livox_pcl_cbk3(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 {
     RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping"), "Lidar 3 (aux 1) Livox callback");
     if (!p_pre_aux[1]) return;
+    const double hdr_t = get_time_sec(msg->header.stamp);
     PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
     p_pre_aux[1]->process(msg, ptr);
-    push_aux_lidar_after_preprocess(ptr, 1);
+    push_aux_lidar_after_preprocess(ptr, 1, hdr_t);
 }
 
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
@@ -536,9 +604,10 @@ void standard_pcl_cbk2(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 {
     RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping"), "Lidar 2 (aux 0) standard PCL callback");
     if (!p_pre_aux[0]) return;
+    const double hdr_t = get_time_sec(msg->header.stamp);
     PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
     p_pre_aux[0]->process(msg, ptr);
-    push_aux_lidar_after_preprocess(ptr, 0);
+    push_aux_lidar_after_preprocess(ptr, 0, hdr_t);
 }
 
 /** 第三路 PointCloud2 */
@@ -546,9 +615,10 @@ void standard_pcl_cbk3(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 {
     RCLCPP_DEBUG(rclcpp::get_logger("laser_mapping"), "Lidar 3 (aux 1) standard PCL callback");
     if (!p_pre_aux[1]) return;
+    const double hdr_t = get_time_sec(msg->header.stamp);
     PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
     p_pre_aux[1]->process(msg, ptr);
-    push_aux_lidar_after_preprocess(ptr, 1);
+    push_aux_lidar_after_preprocess(ptr, 1, hdr_t);
 }
 
 double lidar_mean_scantime = 0.0;
@@ -725,13 +795,45 @@ void publish_frame_body_fusion(
     // 1. 主雷达当前帧（主雷达坐标系）
     int size_main = feats_undistort->points.size();
 
-    // 2. 各辅雷达最新一帧（已在回调中变到主雷达坐标系）
+    // 2. 各辅雷达：与当前主帧 lidar_end_time 时间最接近的一帧（已在回调中变到主雷达坐标系）
     PointCloudXYZI::Ptr aux_latest[kMaxAuxLidars];
+    AuxPickResult aux_pick_info[kMaxAuxLidars];
     {
         std::lock_guard<std::mutex> lock(mtx_buffer);
         for (int a = 0; a < lidar_count - 1 && a < kMaxAuxLidars; ++a) {
-            if (!lidar_buffer_aux[a].empty())
-                aux_latest[a] = lidar_buffer_aux[a].back();
+            aux_pick_info[a] = aux_closest_pick(a, lidar_end_time);
+            aux_latest[a] = aux_pick_info[a].cloud;
+        }
+    }
+
+    if (aux_sync_time_log_ms > 0 && lidar_count >= 2) {
+        rclcpp::Clock steady_clk(RCL_STEADY_TIME);
+        const int throttle_ms = std::max(1, aux_sync_time_log_ms);
+        if (lidar_count == 2) {
+            const auto &p = aux_pick_info[0];
+            if (!p.has_candidate)
+                RCLCPP_INFO_THROTTLE(rclcpp::get_logger("laser_mapping"), steady_clk, throttle_ms,
+                    "[fusion] lidar_end=%.6f 辅路0: 缓冲区空", lidar_end_time);
+            else if (p.rejected)
+                RCLCPP_WARN_THROTTLE(rclcpp::get_logger("laser_mapping"), steady_clk, throttle_ms,
+                    "[fusion] lidar_end=%.6f 辅路0: |dt|=%.6fs 超过 aux_time_sync_max_diff=%.6f，未融合该帧",
+                    lidar_end_time, std::fabs(p.signed_dt), aux_time_sync_max_diff);
+            else
+                RCLCPP_INFO_THROTTLE(rclcpp::get_logger("laser_mapping"), steady_clk, throttle_ms,
+                    "[fusion] lidar_end=%.6f 辅路0: aux_stamp=%.6f 时间差(aux−主结束)=%+.6fs |dt|=%.6fs",
+                    lidar_end_time, p.aux_stamp_sec, p.signed_dt, std::fabs(p.signed_dt));
+        } else if (lidar_count >= 3) {
+            const auto &p0 = aux_pick_info[0];
+            const auto &p1 = aux_pick_info[1];
+            RCLCPP_INFO_THROTTLE(rclcpp::get_logger("laser_mapping"), steady_clk, throttle_ms,
+                "[fusion] lidar_end=%.6f 辅0: aux_stamp=%.6f dt=%+.6fs%s 辅1: aux_stamp=%.6f dt=%+.6fs%s",
+                lidar_end_time,
+                p0.has_candidate ? p0.aux_stamp_sec : 0.0,
+                p0.has_candidate ? p0.signed_dt : 0.0,
+                !p0.has_candidate ? " (空)" : (p0.rejected ? " (拒)" : ""),
+                p1.has_candidate ? p1.aux_stamp_sec : 0.0,
+                p1.has_candidate ? p1.signed_dt : 0.0,
+                !p1.has_candidate ? " (空)" : (p1.rejected ? " (拒)" : ""));
         }
     }
 
@@ -1239,6 +1341,14 @@ public:
         this->declare_parameter<int>("multi.scan_line_3", -1);
         this->declare_parameter<int>("multi.timestamp_unit_3", -1);
         this->declare_parameter<int>("multi.scan_rate_3", -1);
+        /** 辅雷达体素边长(m)。<0：与 filter_size_surf 相同；0：关闭；>0：使用该体素 */
+        this->declare_parameter<double>("multi.filter_size_voxel_lidar_2", -1.0);
+        this->declare_parameter<double>("multi.filter_size_voxel_lidar_3", -1.0);
+        this->declare_parameter<double>("multi.aux_time_sync_max_diff", -1.0);
+        /** 每路辅雷达队列最大长度；<=0 表示不限制（仅按内存与辅帧率增长） */
+        this->declare_parameter<int>("multi.aux_buffer_max_size", 32);
+        /** 打印辅帧与主帧 lidar_end_time 之时间差的日志节流周期（毫秒）；0 关闭 */
+        this->declare_parameter<int>("multi.aux_sync_time_log_ms", 1000);
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -1256,6 +1366,14 @@ public:
         this->get_parameter_or<double>("filter_size_corner",filter_size_corner_min,0.5);
         this->get_parameter_or<double>("filter_size_surf",filter_size_surf_min,0.5);
         this->get_parameter_or<double>("filter_size_map",filter_size_map_min,0.5);
+        double fs_vox_aux2 = -1.0, fs_vox_aux3 = -1.0;
+        this->get_parameter_or<double>("multi.filter_size_voxel_lidar_2", fs_vox_aux2, -1.0);
+        this->get_parameter_or<double>("multi.filter_size_voxel_lidar_3", fs_vox_aux3, -1.0);
+        filter_size_aux_voxel[0] = (fs_vox_aux2 < 0.0) ? filter_size_surf_min : fs_vox_aux2;
+        filter_size_aux_voxel[1] = (fs_vox_aux3 < 0.0) ? filter_size_surf_min : fs_vox_aux3;
+        this->get_parameter_or<double>("multi.aux_time_sync_max_diff", aux_time_sync_max_diff, -1.0);
+        this->get_parameter_or<int>("multi.aux_buffer_max_size", aux_buffer_max_size, 32);
+        this->get_parameter_or<int>("multi.aux_sync_time_log_ms", aux_sync_time_log_ms, 1000);
         this->get_parameter_or<double>("cube_side_length",cube_len,200.f);
         this->get_parameter_or<float>("mapping.det_range",DET_RANGE,300.f);
         this->get_parameter_or<double>("mapping.fov_degree",fov_deg,180.f);
@@ -1353,10 +1471,24 @@ public:
             RCLCPP_INFO(this->get_logger(),
                 "Multi-LiDAR: lidar_count=%d；辅路0 topic=%s preprocess_type=%d",
                 lidar_count, lid_topic_2.c_str(), p_pre_aux[0]->lidar_type);
+            if (filter_size_aux_voxel[0] > 0.0)
+                RCLCPP_INFO(this->get_logger(),
+                    "Multi-LiDAR: 辅路0 体素下采样 leaf=%.4f m", filter_size_aux_voxel[0]);
+            else
+                RCLCPP_INFO(this->get_logger(),
+                    "Multi-LiDAR: 辅路0 体素下采样: off");
             if (lidar_count >= 3 && p_pre_aux[1])
                 RCLCPP_INFO(this->get_logger(),
                     "Multi-LiDAR: 辅路1 topic=%s preprocess_type=%d",
                     lid_topic_3.c_str(), p_pre_aux[1]->lidar_type);
+            if (lidar_count >= 3) {
+                if (filter_size_aux_voxel[1] > 0.0)
+                    RCLCPP_INFO(this->get_logger(),
+                        "Multi-LiDAR: 辅路1 体素下采样 leaf=%.4f m", filter_size_aux_voxel[1]);
+                else
+                    RCLCPP_INFO(this->get_logger(),
+                        "Multi-LiDAR: 辅路1 体素下采样: off");
+            }
         }
 
         if (debug_info)
@@ -1386,6 +1518,7 @@ public:
             RCLCPP_INFO(this->get_logger(), "%sfilter_size_corner_min%s: %s%.3f%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, filter_size_corner_min, COLOR_RESET);
             RCLCPP_INFO(this->get_logger(), "%sfilter_size_surf_min%s: %s%.3f%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, filter_size_surf_min, COLOR_RESET);
             RCLCPP_INFO(this->get_logger(), "%sfilter_size_map_min%s: %s%.3f%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, filter_size_map_min, COLOR_RESET);
+            RCLCPP_INFO(this->get_logger(), "%sfilter_size_aux_voxel[0/1]%s: %s%.4f / %.4f (0=off)%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, filter_size_aux_voxel[0], filter_size_aux_voxel[1], COLOR_RESET);
             RCLCPP_INFO(this->get_logger(), "%scube_len%s: %s%.3f%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, cube_len, COLOR_RESET);    
             RCLCPP_INFO(this->get_logger(), "%sDET_RANGE%s: %s%.3f%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, DET_RANGE, COLOR_RESET);
             RCLCPP_INFO(this->get_logger(), "%sfov_deg%s: %s%.3f%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, fov_deg, COLOR_RESET);
@@ -1496,6 +1629,11 @@ public:
         memset(res_last, -1000.0f, sizeof(res_last));
         downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
         downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
+        for (int i = 0; i < kMaxAuxLidars; ++i) {
+            if (filter_size_aux_voxel[i] > 0.0)
+                downSizeFilterAux[i].setLeafSize(
+                    filter_size_aux_voxel[i], filter_size_aux_voxel[i], filter_size_aux_voxel[i]);
+        }
         memset(point_selected_surf, true, sizeof(point_selected_surf));
         memset(res_last, -1000.0f, sizeof(res_last));
 

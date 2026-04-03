@@ -47,6 +47,8 @@
             multi_en: true
             removed_en: false
             aux_time_sync_max_diff: 0.15
+            aux_buffer_max_size: 32
+            aux_sync_time_log_ms: 1000
 
             # ---------- 第 2 路（相对「主雷达 / common.lid_topic」坐标系的外参）----------
             # lidar_type：-1 或未写则同 preprocess.lidar_type
