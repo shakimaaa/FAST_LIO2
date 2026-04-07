@@ -60,6 +60,12 @@
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/static_transform_broadcaster.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/buffer_interface.hpp>
+#include <tf2_ros/transform_listener.h>
+#include <tf2/exceptions.h>
+#include <tf2_eigen/tf2_eigen.hpp>
+#include <memory>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -114,6 +120,14 @@ bool   multi_en = false; // whether to use multiple lidars
 bool   debug_info = false; // whether to print debug info
 bool   removed_en = false; // whether to publish removed points
 
+static std::shared_ptr<tf2_ros::Buffer> g_leg_tf_buffer;
+static std::shared_ptr<tf2_ros::TransformListener> g_leg_tf_listener;
+static bool g_leg_filter_capsule_en = true;
+static bool g_leg_filter_crop_fallback = true;
+static std::string g_leg_filter_target_frame = "lidar_link";
+static bool g_leg_filter_tf_ready = false;
+static rclcpp::Clock::SharedPtr g_leg_log_clock;
+
 vector<vector<int>>  pointSearchInd_surf; 
 vector<BoxPointType> cub_needrm;
 vector<PointVector>  Nearest_Points; 
@@ -152,6 +166,8 @@ PointCloudXYZI::Ptr corr_normvect(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr _featsArray;
 PointCloudXYZI::Ptr lidar2_filtered_ptr(new PointCloudXYZI());
 PointCloudXYZI::Ptr lidar_aux_removed_cloud[kMaxAuxLidars];  // 各辅雷达被滤掉的点云（调试）
+/** 主雷达腿滤除点（调试）；与辅路 removed 在 publish_lidar2_removed 中合并 */
+PointCloudXYZI::Ptr lidar_main_removed_cloud;
 
 pcl::VoxelGrid<PointType> downSizeFilterSurf;
 pcl::VoxelGrid<PointType> downSizeFilterMap;
@@ -329,7 +345,117 @@ void lasermap_fov_segment()
     kdtree_delete_time = omp_get_wtime() - delete_begin;
 }
 
-void filter_rear_legs_lidar1(const PointCloudXYZI::Ptr& input,
+static float dist_sq_point_segment(const Eigen::Vector3f& p, const Eigen::Vector3f& a, const Eigen::Vector3f& b)
+{
+    const Eigen::Vector3f ab = b - a;
+    const float ab2 = ab.squaredNorm();
+    if (ab2 < 1e-12f) return (p - a).squaredNorm();
+    float t = (p - a).dot(ab) / ab2;
+    t = std::max(0.f, std::min(1.f, t));
+    const Eigen::Vector3f closest = a + t * ab;
+    return (p - closest).squaredNorm();
+}
+
+/** lr_pro 四套腿：连杆系内近似肢体中心线与半径；前腿与后腿左右对称沿用同一组局部线段 */
+struct RearLegCapsuleSpec {
+    const char* link_frame;
+    float ax, ay, az, bx, by, bz;
+    float radius;
+};
+static const RearLegCapsuleSpec kRearLegCapsules[] = {
+    {"FL_thigh", 0.f,  0.02f, -0.02f, 0.f,  0.12f, -0.33f, 0.09f},
+    {"FL_calf",  0.f,  0.f,    -0.05f, 0.f,  0.f,    -0.32f, 0.07f},
+    {"FR_thigh", 0.f, -0.02f, -0.02f, 0.f, -0.12f, -0.33f, 0.09f},
+    {"FR_calf",  0.f,  0.f,    -0.05f, 0.f,  0.f,    -0.32f, 0.07f},
+    {"RL_thigh", 0.f,  0.02f, -0.02f, 0.f,  0.12f, -0.33f, 0.09f},
+    {"RL_calf",  0.f,  0.f,    -0.05f, 0.f,  0.f,    -0.32f, 0.07f},
+    {"RR_thigh", 0.f, -0.02f, -0.02f, 0.f, -0.12f, -0.33f, 0.09f},
+    {"RR_calf",  0.f,  0.f,    -0.05f, 0.f,  0.f,    -0.32f, 0.07f},
+};
+static constexpr size_t kNumRearLegCapsules = sizeof(kRearLegCapsules) / sizeof(kRearLegCapsules[0]);
+
+static bool filter_rear_legs_capsule_tf(const PointCloudXYZI::Ptr& input_fixed,
+    PointCloudXYZI::Ptr& output,
+    PointCloudXYZI::Ptr removed_out,
+    double header_stamp_sec)
+{
+    if (!g_leg_tf_buffer || !g_leg_filter_tf_ready) return false;
+
+    Eigen::Vector3f a_w[kNumRearLegCapsules];
+    Eigen::Vector3f b_w[kNumRearLegCapsules];
+    float r2[kNumRearLegCapsules];
+
+    const rclcpp::Time rtime(static_cast<int64_t>(header_stamp_sec * 1e9));
+    const tf2::TimePoint tp_try = tf2_ros::fromRclcpp(rtime);
+
+    try {
+        for (size_t i = 0; i < kNumRearLegCapsules; ++i) {
+            const RearLegCapsuleSpec& sp = kRearLegCapsules[i];
+            geometry_msgs::msg::TransformStamped st;
+            try {
+                st = g_leg_tf_buffer->lookupTransform(g_leg_filter_target_frame, sp.link_frame, tp_try);
+            } catch (const tf2::TransformException&) {
+                st = g_leg_tf_buffer->lookupTransform(g_leg_filter_target_frame, sp.link_frame, tf2::TimePointZero);
+            }
+            const Eigen::Isometry3d Te = tf2::transformToEigen(st.transform);
+            const Eigen::Vector3d ad = Te * Eigen::Vector3d(sp.ax, sp.ay, sp.az);
+            const Eigen::Vector3d bd = Te * Eigen::Vector3d(sp.bx, sp.by, sp.bz);
+            a_w[i] = ad.cast<float>();
+            b_w[i] = bd.cast<float>();
+            r2[i] = sp.radius * sp.radius;
+        }
+    } catch (const tf2::TransformException& ex) {
+        if (g_leg_log_clock) {
+            RCLCPP_WARN_THROTTLE(
+                rclcpp::get_logger("laser_mapping"), *g_leg_log_clock, 5000,
+                "Leg capsule filter: TF failed (%s), %s", g_leg_filter_target_frame.c_str(), ex.what());
+        } else {
+            RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                "Leg capsule filter: TF failed (%s), %s", g_leg_filter_target_frame.c_str(), ex.what());
+        }
+        return false;
+    }
+
+    output->clear();
+    output->points.reserve(input_fixed->size());
+    if (removed_en && removed_out) removed_out->clear();
+
+    for (const auto& pt : input_fixed->points) {
+        const Eigen::Vector3f p(pt.x, pt.y, pt.z);
+        bool inside = false;
+        for (size_t i = 0; i < kNumRearLegCapsules; ++i) {
+            if (dist_sq_point_segment(p, a_w[i], b_w[i]) <= r2[i]) {
+                inside = true;
+                break;
+            }
+        }
+        if (!inside) {
+            output->points.push_back(pt);
+        } else if (removed_en && removed_out) {
+            removed_out->points.push_back(pt);
+        }
+    }
+    output->width = output->empty() ? 0 : static_cast<uint32_t>(output->size());
+    output->height = 1;
+    if (removed_en && removed_out) {
+        removed_out->width = removed_out->empty() ? 0 : static_cast<uint32_t>(removed_out->size());
+        removed_out->height = 1;
+    }
+
+    if (removed_en) {
+        static int _dbg_caps = 0;
+        if (++_dbg_caps % 50 == 0) {
+            const size_t in_sz = input_fixed->size(), out_sz = output->size();
+            RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                "[filter_rear_legs] capsule TF in=%zu out=%zu removed=%zu",
+                in_sz, out_sz, in_sz > out_sz ? in_sz - out_sz : 0);
+        }
+    }
+    return true;
+}
+
+/** 主雷达系下固定 CropBox（TF 失败时回退） */
+static void filter_rear_legs_cropbox(const PointCloudXYZI::Ptr& input,
     PointCloudXYZI::Ptr& output,
     PointCloudXYZI::Ptr removed_out)
 {
@@ -339,7 +465,6 @@ void filter_rear_legs_lidar1(const PointCloudXYZI::Ptr& input,
         return;
     }
 
-    // 确保 PCL 滤波器能正确遍历（部分版本依赖 width/height）
     PointCloudXYZI::Ptr input_fixed(new PointCloudXYZI());
     *input_fixed = *input;
     if (input_fixed->width == 0 && !input_fixed->empty()) {
@@ -349,12 +474,9 @@ void filter_rear_legs_lidar1(const PointCloudXYZI::Ptr& input,
 
     PointCloudXYZI::Ptr tmp(new PointCloudXYZI());
     PointCloudXYZI::Ptr tmp2(new PointCloudXYZI());
+    PointCloudXYZI::Ptr tmp3(new PointCloudXYZI());
 
-    // 主雷达坐标系下后腿大致范围（x≈高度, y≈左右, z≈前后，后腿在 z 正方向）
-    // 适当放宽边界以免漏掉边缘点
     const float margin = 0.02f;
-    // ===== 左后腿 RL (y 正) =====
-    // 内侧 (y_min) 不加 margin，避免两个盒子在 y=0 处连成一片
     pcl::CropBox<PointType> crop_rl;
     crop_rl.setInputCloud(input_fixed);
     crop_rl.setMin(Eigen::Vector4f(-0.05f - margin,  0.15f,          -1.1f - margin, 1.0f));
@@ -362,8 +484,6 @@ void filter_rear_legs_lidar1(const PointCloudXYZI::Ptr& input,
     crop_rl.setNegative(true);
     crop_rl.filter(*tmp);
 
-    // ===== 右后腿 RR (y 负) =====
-    // 内侧 (y_max) 不加 margin，同理
     pcl::CropBox<PointType> crop_rr;
     crop_rr.setInputCloud(tmp);
     crop_rr.setMin(Eigen::Vector4f(-0.05f - margin, -0.30f - margin, -1.1f - margin, 1.0f));
@@ -371,14 +491,28 @@ void filter_rear_legs_lidar1(const PointCloudXYZI::Ptr& input,
     crop_rr.setNegative(true);
     crop_rr.filter(*tmp2);
 
-    *output = *tmp2;
+    /* 前腿：主雷达系下与后腿 crop 关于 x 近似对称（后腿 x∈[-0.05,0.82]，前腿 x∈[-0.82,-0.05]） */
+    pcl::CropBox<PointType> crop_fl;
+    crop_fl.setInputCloud(tmp2);
+    crop_fl.setMin(Eigen::Vector4f(-0.82f - margin,  0.15f,          -1.1f - margin, 1.0f));
+    crop_fl.setMax(Eigen::Vector4f(-0.05f + margin,  0.30f + margin, -0.70f + margin, 1.0f));
+    crop_fl.setNegative(true);
+    crop_fl.filter(*tmp3);
 
-    // 若需要，收集被滤掉的点（两个盒子内的点）并输出
+    pcl::CropBox<PointType> crop_fr;
+    crop_fr.setInputCloud(tmp3);
+    crop_fr.setMin(Eigen::Vector4f(-0.82f - margin, -0.30f - margin, -1.1f - margin, 1.0f));
+    crop_fr.setMax(Eigen::Vector4f(-0.05f + margin, -0.15f,          -0.70f + margin, 1.0f));
+    crop_fr.setNegative(true);
+    crop_fr.filter(*output);
+
     if (removed_en) {
         removed_out->clear();
         PointCloudXYZI::Ptr in_rl(new PointCloudXYZI());
         PointCloudXYZI::Ptr in_rr(new PointCloudXYZI());
-        pcl::CropBox<PointType> box_rl, box_rr;
+        PointCloudXYZI::Ptr in_fl(new PointCloudXYZI());
+        PointCloudXYZI::Ptr in_fr(new PointCloudXYZI());
+        pcl::CropBox<PointType> box_rl, box_rr, box_fl, box_fr;
         box_rl.setInputCloud(input_fixed);
         box_rl.setMin(Eigen::Vector4f(-0.05f - margin,  0.04f,          -1.1f - margin, 1.0f));
         box_rl.setMax(Eigen::Vector4f( 0.82f + margin,  0.30f + margin, -0.70f + margin, 1.0f));
@@ -389,19 +523,60 @@ void filter_rear_legs_lidar1(const PointCloudXYZI::Ptr& input,
         box_rr.setMax(Eigen::Vector4f( 0.82f + margin, -0.04f,          -0.70f + margin, 1.0f));
         box_rr.setNegative(false);
         box_rr.filter(*in_rr);
+        box_fl.setInputCloud(input_fixed);
+        box_fl.setMin(Eigen::Vector4f(-0.82f - margin,  0.04f,          -1.1f - margin, 1.0f));
+        box_fl.setMax(Eigen::Vector4f(-0.05f + margin,  0.30f + margin, -0.70f + margin, 1.0f));
+        box_fl.setNegative(false);
+        box_fl.filter(*in_fl);
+        box_fr.setInputCloud(input_fixed);
+        box_fr.setMin(Eigen::Vector4f(-0.82f - margin, -0.30f - margin, -1.1f - margin, 1.0f));
+        box_fr.setMax(Eigen::Vector4f(-0.05f + margin, -0.04f,          -0.70f + margin, 1.0f));
+        box_fr.setNegative(false);
+        box_fr.filter(*in_fr);
         *removed_out = *in_rl;
         *removed_out += *in_rr;
+        *removed_out += *in_fl;
+        *removed_out += *in_fr;
     }
 
-    // 调试：若滤掉不少点则打印一次（避免刷屏）
     if (removed_en) {
-    static int _dbg_count = 0;
-    if (++_dbg_count % 50 == 0) {
-        size_t in_sz = input->size(), out_sz = tmp2->size();
-        RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
-            "[filter_rear_legs] lidar2 in=%zu out=%zu removed=%zu",
+        static int _dbg_count = 0;
+        if (++_dbg_count % 50 == 0) {
+            const size_t in_sz = input->size(), out_sz = output->size();
+            RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                "[filter_rear_legs] cropbox fallback in=%zu out=%zu removed=%zu",
                 in_sz, out_sz, in_sz > out_sz ? in_sz - out_sz : 0);
         }
+    }
+}
+
+void filter_rear_legs_lidar1(const PointCloudXYZI::Ptr& input,
+    PointCloudXYZI::Ptr& output,
+    PointCloudXYZI::Ptr removed_out,
+    double header_stamp_sec)
+{
+    if (!input || input->empty()) {
+        if (output) output->clear();
+        if (removed_out) removed_out->clear();
+        return;
+    }
+
+    PointCloudXYZI::Ptr input_fixed(new PointCloudXYZI());
+    *input_fixed = *input;
+    if (input_fixed->width == 0 && !input_fixed->empty()) {
+        input_fixed->width = input_fixed->size();
+        input_fixed->height = 1;
+    }
+
+    if (g_leg_filter_capsule_en &&
+        filter_rear_legs_capsule_tf(input_fixed, output, removed_out, header_stamp_sec)) {
+        return;
+    }
+    if (g_leg_filter_crop_fallback) {
+        filter_rear_legs_cropbox(input, output, removed_out);
+    } else {
+        *output = *input_fixed;
+        if (removed_out) removed_out->clear();
     }
 }
 
@@ -431,7 +606,7 @@ static void push_aux_lidar_after_preprocess(PointCloudXYZI::Ptr lidar_ptr, int a
     PointCloudXYZI::Ptr filtered_ptr(new PointCloudXYZI());
     filtered_ptr->points.reserve(lidar_ptr->points.size());
     PointCloudXYZI::Ptr removed_ptr(new PointCloudXYZI());
-    filter_rear_legs_lidar1(lidar_ptr, filtered_ptr, removed_ptr);
+    filter_rear_legs_lidar1(lidar_ptr, filtered_ptr, removed_ptr, header_stamp_sec);
     std::lock_guard<std::mutex> lock(mtx_buffer);
     lidar_buffer_aux[aux_idx].push_back(AuxLidarFrame{filtered_ptr, header_stamp_sec});
     while (aux_buffer_max_size > 0 &&
@@ -439,6 +614,21 @@ static void push_aux_lidar_after_preprocess(PointCloudXYZI::Ptr lidar_ptr, int a
         lidar_buffer_aux[aux_idx].pop_front();
     }
     lidar_aux_removed_cloud[aux_idx] = removed_ptr;
+}
+
+/** 主雷达：预处理输出已在主雷达系，与辅路相同腿滤波；调用方须已持有 mtx_buffer */
+static void apply_primary_leg_filter(PointCloudXYZI::Ptr& ptr, double header_stamp_sec)
+{
+    if (!ptr || ptr->empty()) {
+        lidar_main_removed_cloud.reset();
+        return;
+    }
+    PointCloudXYZI::Ptr filtered(new PointCloudXYZI());
+    filtered->points.reserve(ptr->points.size());
+    PointCloudXYZI::Ptr removed(new PointCloudXYZI());
+    filter_rear_legs_lidar1(ptr, filtered, removed, header_stamp_sec);
+    ptr = filtered;
+    lidar_main_removed_cloud = removed;
 }
 
 /** 与 lidar_end_time 配对的辅帧结果（须在已持有 mtx_buffer 下调用 aux_closest_pick） */
@@ -488,6 +678,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
         lidar_buffer.clear();
+        lidar_main_removed_cloud.reset();
     }
     if (is_first_lidar)
     {
@@ -496,6 +687,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr);
+    apply_primary_leg_filter(ptr, cur_time);
     // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "here is ok");
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(cur_time);
@@ -518,6 +710,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
         lidar_buffer.clear();
+        lidar_main_removed_cloud.reset();
     }
     if(is_first_lidar)
     {
@@ -539,6 +732,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr);
+    apply_primary_leg_filter(ptr, cur_time);
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(last_timestamp_lidar);
     
@@ -879,6 +1073,8 @@ void publish_lidar2_removed(
     PointCloudXYZI::Ptr merged(new PointCloudXYZI());
     {
         std::lock_guard<std::mutex> lock(mtx_buffer);
+        if (lidar_main_removed_cloud && !lidar_main_removed_cloud->empty())
+            *merged += *lidar_main_removed_cloud;
         for (int a = 0; a < lidar_count - 1 && a < kMaxAuxLidars; ++a) {
             if (lidar_aux_removed_cloud[a] && !lidar_aux_removed_cloud[a]->empty())
                 *merged += *lidar_aux_removed_cloud[a];
@@ -1349,6 +1545,9 @@ public:
         this->declare_parameter<int>("multi.aux_buffer_max_size", 32);
         /** 打印辅帧与主帧 lidar_end_time 之时间差的日志节流周期（毫秒）；0 关闭 */
         this->declare_parameter<int>("multi.aux_sync_time_log_ms", 1000);
+        this->declare_parameter<bool>("multi.leg_filter_capsule_en", true);
+        this->declare_parameter<bool>("multi.leg_filter_crop_fallback", true);
+        this->declare_parameter<string>("multi.leg_filter_target_frame", "lidar_link");
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -1374,6 +1573,9 @@ public:
         this->get_parameter_or<double>("multi.aux_time_sync_max_diff", aux_time_sync_max_diff, -1.0);
         this->get_parameter_or<int>("multi.aux_buffer_max_size", aux_buffer_max_size, 32);
         this->get_parameter_or<int>("multi.aux_sync_time_log_ms", aux_sync_time_log_ms, 1000);
+        this->get_parameter_or<bool>("multi.leg_filter_capsule_en", g_leg_filter_capsule_en, true);
+        this->get_parameter_or<bool>("multi.leg_filter_crop_fallback", g_leg_filter_crop_fallback, true);
+        this->get_parameter_or<string>("multi.leg_filter_target_frame", g_leg_filter_target_frame, "lidar_link");
         this->get_parameter_or<double>("cube_side_length",cube_len,200.f);
         this->get_parameter_or<float>("mapping.det_range",DET_RANGE,300.f);
         this->get_parameter_or<double>("mapping.fov_degree",fov_deg,180.f);
@@ -1792,6 +1994,23 @@ public:
         fclose(fp);
     }
 
+    void init_tf_for_leg_filter(rclcpp::Node::SharedPtr nh)
+    {
+        if (!nh) return;
+        g_leg_log_clock = nh->get_clock();
+        if (!g_leg_filter_capsule_en) {
+            RCLCPP_INFO(this->get_logger(),
+                "Leg capsule filter off (multi.leg_filter_capsule_en=false).");
+            return;
+        }
+        g_leg_tf_buffer = std::make_shared<tf2_ros::Buffer>(nh->get_clock());
+        g_leg_tf_listener = std::make_shared<tf2_ros::TransformListener>(*g_leg_tf_buffer, nh, true);
+        g_leg_filter_tf_ready = true;
+        RCLCPP_INFO(this->get_logger(),
+            "Leg capsule filter: TF listener OK, target_frame=%s (need /tf + joint_states->robot_state_publisher)",
+            g_leg_filter_target_frame.c_str());
+    }
+
 private:
     void timer_callback()
     {
@@ -1913,12 +2132,11 @@ private:
             if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
-            // 第二雷达裁剪+外参变换后的点云（测试过滤），与其它点云一起在 timer 中发布
-            if (lidar_count >= 2) {
+            // 多雷达：融合点云；removed_en：主+辅被腿滤除点合并发布（单主雷达时也可只看主路 removed）
+            if (lidar_count >= 2)
                 publish_frame_body_fusion(pubLaserCloudFull_fusion_);
-                if (removed_en)
-                    publish_lidar2_removed(pubLaserCloudRemoved_);
-            }
+            if (removed_en)
+                publish_lidar2_removed(pubLaserCloudRemoved_);
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
 
             /*** Debug variables ***/
@@ -2023,7 +2241,9 @@ int main(int argc, char** argv)
 
     signal(SIGINT, SigHandle);
 
-    rclcpp::spin(std::make_shared<LaserMappingNode>());
+    auto laser_mapping_node = std::make_shared<LaserMappingNode>();
+    laser_mapping_node->init_tf_for_leg_filter(std::static_pointer_cast<rclcpp::Node>(laser_mapping_node));
+    rclcpp::spin(laser_mapping_node);
 
     // // 启用多线程执行器
     // rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 4);

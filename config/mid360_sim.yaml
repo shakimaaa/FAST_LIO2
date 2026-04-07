@@ -48,6 +48,9 @@
             extrinsic_R: [ 0.25978189, 0.0,   0.96566732,
                                   0.0,        1.0,   0.0,
                                  -0.96566732, 0.0,   0.25978189 ]
+            leg_filter_capsule_en: true
+            leg_filter_crop_fallback: true
+            leg_filter_target_frame: "lidar_link"
 
         publish:
             path_en: true                # true: publish Path

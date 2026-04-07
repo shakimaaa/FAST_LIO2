@@ -21,9 +21,9 @@
         preprocess:
             lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 4 for any other pointcloud input
             scan_line:  4
-            blind: 0.45
+            blind: 0.
             timestamp_unit: 3
-            scan_rate: 16
+            scan_rate: 10
 
         mapping:
             # 顺滑路径：减小 IMU 过程噪声，更信任 IMU 预测，轨迹更平滑（若过于平滑可适当增大）
@@ -46,29 +46,34 @@
             lidar_count: 3
             multi_en: true
             removed_en: false
-            aux_time_sync_max_diff: 0.15
+            # 辅帧 header 与主帧 lidar_end_time 最大允许 |dt|（秒）；<=0 不丢弃，仍取最接近帧
+            aux_time_sync_max_diff: -1. #0.8
+            # 每路辅雷达队列最大帧数；<=0 不限制长度
             aux_buffer_max_size: 32
-            aux_sync_time_log_ms: 1000
+            # 融合时打印「辅 header − 主 lidar_end」时间差，节流周期(ms)；0=不打印 默认值1000
+            aux_sync_time_log_ms: 0 #1000
 
-            # ---------- 第 2 路（相对「主雷达 / common.lid_topic」坐标系的外参）----------
-            # lidar_type：-1 或未写则同 preprocess.lidar_type
-            # 1=Livox CustomMsg；2/3/4 等为 PointCloud2（见 preprocess 注释）
+            # 辅雷达并入主雷达系后：TF+胶囊剔 RL/RR 自点（需 joint_states + robot_state_publisher）
+            leg_filter_capsule_en: true
+            leg_filter_crop_fallback: true
+            leg_filter_target_frame: "lidar_link"
+
+            # 辅路体素(m)：默认不写则与顶层 filter_size_surf 相同；0=关闭下采样
+            filter_size_voxel_lidar_2: 0.1  # 0.1
+            filter_size_voxel_lidar_3: 0.1
+
+            # ---------- 第 2 路（相对主雷达坐标系的外参）----------
             lidar_type: 5
-            lid_topic_2: "/lidar2/lidar/points"  #"/mid360_2"
-            # Lidar2_to_Lidar_T: [ 0.0998, 0., -0.2001 ]
-            # Lidar2_to_Lidar_R: [ 0.25978189, 0.0,   0.96566732,
-            #                       0.0,        1.0,   0.0,
-            #                      -0.96566732, 0.0,   0.25978189 ]
+            lid_topic_2: "/lidar2/lidar/points"
             Lidar2_to_Lidar_T: [ 0.1, 0., -0.1 ]
             Lidar2_to_Lidar_R: [ 0.707671, 0., -0.706542,
                                   0.0,        1.0,   0.0,
                                  0.706542, 0.,  0.707671 ]
-            # 与主雷达不一致时再取消注释：
             # scan_line: 4
             # timestamp_unit: 3
             # scan_rate: 16
 
-            # ---------- 第 3 路（仅当 lidar_count: 3 时生效）----------
+            # ---------- 第 3 路（仅当 lidar_count: 3）----------
             lid_topic_3: "/lidar3/lidar/points"
             lidar_type_3: 5                    # -1 表示同主雷达
             # ROS2 要求 double[] 序列类型一致，勿写裸 0（会变成 int）
@@ -93,3 +98,5 @@
             pcd_save_en: true
             interval: -1                 # how many LiDAR frames saved in each pcd file; 
                                         # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
+
+

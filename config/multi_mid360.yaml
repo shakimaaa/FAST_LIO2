@@ -53,6 +53,10 @@
             # 融合时打印「辅 header − 主 lidar_end」时间差，节流周期(ms)；0=不打印 默认值1000
             aux_sync_time_log_ms: 0 #1000
 
+            leg_filter_capsule_en: true
+            leg_filter_crop_fallback: true
+            leg_filter_target_frame: "lidar_link"
+
             # 辅路体素(m)：默认不写则与顶层 filter_size_surf 相同；0=关闭下采样
             filter_size_voxel_lidar_2: 0.05  # 0.1
             # filter_size_voxel_lidar_3: 0.15
