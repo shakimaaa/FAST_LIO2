@@ -8,7 +8,7 @@
         filter_size_map: 0.3                   # 地图体素(m)：越小地图分辨率越高
         cube_side_length: 1000.0
         runtime_pos_log_enable: false
-        map_file_path: "./src/LIO/FAST_LIO2/PCD/test1.pcd"
+        map_file_path: "./src/LIO/FAST_LIO2/PCD/test2.pcd"
 
         common:
             lid_topic:  "/mid360"
@@ -43,8 +43,8 @@
         multi:
             # 总雷达数 1~3：1=仅主雷达；2=主+第二路；3=主+第二+第三路
             # 省略 lidar_count 时：multi_en false→1；multi_en true→2（兼容旧配置）
-            lidar_count: 3
-            multi_en: true
+            lidar_count: 1
+            multi_en: false
             removed_en: false
             # 辅帧 header 与主帧 lidar_end_time 最大允许 |dt|（秒）；<=0 不丢弃，仍取最接近帧
             aux_time_sync_max_diff: -1. #0.8
@@ -63,12 +63,12 @@
             filter_size_voxel_lidar_3: 0.1
 
             # ---------- 第 2 路（相对主雷达坐标系的外参）----------
-            lidar_type: 5
-            lid_topic_2: "/lidar2/lidar/points"
-            Lidar2_to_Lidar_T: [ 0.1, 0., -0.1 ]
-            Lidar2_to_Lidar_R: [ 0.707671, 0., -0.706542,
+            lidar_type: 1
+            lid_topic_2: "/mid360_2"
+            Lidar2_to_Lidar_T: [ 0.1, 0., -0.2 ]
+            Lidar2_to_Lidar_R: [ 0.259, 0., 0.966,
                                   0.0,        1.0,   0.0,
-                                 0.706542, 0.,  0.707671 ]
+                                 -0.966, 0.,  0.259 ]
             # scan_line: 4
             # timestamp_unit: 3
             # scan_rate: 16

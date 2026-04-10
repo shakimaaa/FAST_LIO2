@@ -1344,7 +1344,32 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
 {
-    set_posestamp(msg_body_pose);
+    // Keep Path aligned with odometry pose (camera_init -> robot).
+    const double lever_norm = 0.48;
+    const Eigen::Vector3d lever_arm_body(0.0, 0.0, -lever_norm);
+    const Eigen::Matrix3d R_ci_b = state_point.rot.toRotationMatrix();
+
+    tf2::Quaternion q_by_ro(0.0, -0.70710678, 0.0, 0.70710678);
+    tf2::Matrix3x3 m_by_ro(q_by_ro);
+    Eigen::Matrix3d R_by_ro;
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            R_by_ro(r, c) = m_by_ro[r][c];
+
+    const Eigen::Matrix3d R_ci_ro = R_ci_b * R_by_ro;
+    const Eigen::Vector3d p_imu(state_point.pos(0), state_point.pos(1), state_point.pos(2));
+    const Eigen::Vector3d p_robot_ci = p_imu + R_ci_b * lever_arm_body;
+    Eigen::Quaterniond q_ci_ro(R_ci_ro);
+    q_ci_ro.normalize();
+
+    msg_body_pose.pose.position.x = p_robot_ci(0);
+    msg_body_pose.pose.position.y = p_robot_ci(1);
+    msg_body_pose.pose.position.z = p_robot_ci(2);
+    msg_body_pose.pose.orientation.x = q_ci_ro.x();
+    msg_body_pose.pose.orientation.y = q_ci_ro.y();
+    msg_body_pose.pose.orientation.z = q_ci_ro.z();
+    msg_body_pose.pose.orientation.w = q_ci_ro.w();
+
     msg_body_pose.header.stamp = get_ros_time(lidar_end_time); // ros::Time().fromSec(lidar_end_time);
     msg_body_pose.header.frame_id = "camera_init";
 
