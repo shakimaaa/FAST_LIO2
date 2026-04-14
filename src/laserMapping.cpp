@@ -1177,7 +1177,7 @@ void set_posestamp(T & out)
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
 {
     odomAftMapped.header.frame_id = "camera_init";
-    odomAftMapped.child_frame_id = "robot";
+    odomAftMapped.child_frame_id = "_body";
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
 
     // IMU→robot 杆臂在 IMU 本体系（0.5m 沿 body -Z）；用完整 state_point.rot（R_ci_b）变到 camera_init。
@@ -1217,19 +1217,16 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     const Eigen::Vector3d p_imu(state_point.pos(0), state_point.pos(1), state_point.pos(2));
     const Eigen::Vector3d p_robot_ci = p_imu + R_ci_b * lever_arm_body;
 
-    odomAftMapped.pose.pose.position.x = p_robot_ci(0);
-    odomAftMapped.pose.pose.position.y = p_robot_ci(1);
-    odomAftMapped.pose.pose.position.z = p_robot_ci(2);
-    {
-        Eigen::Quaterniond q_ci_ro(R_ci_ro);
-        q_ci_ro.normalize();
-        odomAftMapped.pose.pose.orientation.x = q_ci_ro.x();
-        odomAftMapped.pose.pose.orientation.y = q_ci_ro.y();
-        odomAftMapped.pose.pose.orientation.z = q_ci_ro.z();
-        odomAftMapped.pose.pose.orientation.w = q_ci_ro.w();
-    }
+    // odom 对齐到 _body：位置保持全局 camera_init 坐标，姿态使用 camera_init->_body
+    odomAftMapped.pose.pose.position.x = state_point.pos(0);
+    odomAftMapped.pose.pose.position.y = state_point.pos(1);
+    odomAftMapped.pose.pose.position.z = state_point.pos(2);
+    odomAftMapped.pose.pose.orientation.x = geoQuat.x;
+    odomAftMapped.pose.pose.orientation.y = geoQuat.y;
+    odomAftMapped.pose.pose.orientation.z = geoQuat.z;
+    odomAftMapped.pose.pose.orientation.w = geoQuat.w;
 
-    // 局部速度：robot 原点在世界系下的速度，再投影到 robot 轴（非世界系分量）
+    // 局部速度：使用 _body 原点速度（IMU 原点），并投影到 body 局部轴
     Eigen::Vector3d omega_b(0.0, 0.0, 0.0);
     if (!Measures.imu.empty())
     {
@@ -1238,28 +1235,24 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
             im->angular_velocity.y - state_point.bg(1),
             im->angular_velocity.z - state_point.bg(2);
     }
-    const Eigen::Vector3d omega_w = R_ci_b * omega_b;
-    const Eigen::Vector3d delta_w = R_ci_b * lever_arm_body;
     const Eigen::Vector3d v_imu_w(state_point.vel(0), state_point.vel(1), state_point.vel(2));
-    const Eigen::Vector3d v_robot_w = v_imu_w + omega_w.cross(delta_w);
-    const Eigen::Vector3d v_robot = R_ci_ro.transpose() * v_robot_w;
-    const Eigen::Vector3d omega_robot = R_ci_ro.transpose() * omega_w;
+    const Eigen::Vector3d v_body = R_ci_b.transpose() * v_imu_w;
 
-    odomAftMapped.twist.twist.linear.x = v_robot(0);
-    odomAftMapped.twist.twist.linear.y = v_robot(1);
-    odomAftMapped.twist.twist.linear.z = v_robot(2);
-    odomAftMapped.twist.twist.angular.x = omega_robot(0);
-    odomAftMapped.twist.twist.angular.y = omega_robot(1);
-    odomAftMapped.twist.twist.angular.z = omega_robot(2);
+    odomAftMapped.twist.twist.linear.x = v_body(0);
+    odomAftMapped.twist.twist.linear.y = v_body(1);
+    odomAftMapped.twist.twist.linear.z = v_body(2);
+    odomAftMapped.twist.twist.angular.x = omega_b(0);
+    odomAftMapped.twist.twist.angular.y = omega_b(1);
+    odomAftMapped.twist.twist.angular.z = omega_b(2);
 
-    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "v_robot_x: %f",  v_robot(0));
-    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "v_robot_y: %f",  v_robot(1));
-    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "v_robot_z: %f",  v_robot(2));
+    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "v_body_x: %f",  v_body(0));
+    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "v_body_y: %f",  v_body(1));
+    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"), "v_body_z: %f",  v_body(2));
 
 
     auto P = kf.get_P();
     Eigen::Matrix3d P_vel_world = P.block<3, 3>(12, 12);
-    Eigen::Matrix3d P_vel_robot = R_ci_ro.transpose() * P_vel_world * R_ci_ro;
+    Eigen::Matrix3d P_vel_robot = R_ci_b.transpose() * P_vel_world * R_ci_b;
     for (int i = 0; i < 3; i++)
         for (int j = 0; j < 3; j++)
             odomAftMapped.twist.covariance[i * 6 + j] = P_vel_robot(i, j);
@@ -1573,6 +1566,15 @@ public:
         this->declare_parameter<bool>("multi.leg_filter_capsule_en", true);
         this->declare_parameter<bool>("multi.leg_filter_crop_fallback", true);
         this->declare_parameter<string>("multi.leg_filter_target_frame", "lidar_link");
+        this->declare_parameter<string>("tf.base_to_camera_init.parent_frame", "base");
+        this->declare_parameter<string>("tf.base_to_camera_init.child_frame", "camera_init");
+        this->declare_parameter<double>("tf.base_to_camera_init.tx", 0.482);
+        this->declare_parameter<double>("tf.base_to_camera_init.ty", 0.0);
+        this->declare_parameter<double>("tf.base_to_camera_init.tz", 0.0453);
+        this->declare_parameter<double>("tf.base_to_camera_init.qx", 0.0);
+        this->declare_parameter<double>("tf.base_to_camera_init.qy", 0.70710678);
+        this->declare_parameter<double>("tf.base_to_camera_init.qz", 0.0);
+        this->declare_parameter<double>("tf.base_to_camera_init.qw", 0.70710678);
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -1601,6 +1603,19 @@ public:
         this->get_parameter_or<bool>("multi.leg_filter_capsule_en", g_leg_filter_capsule_en, true);
         this->get_parameter_or<bool>("multi.leg_filter_crop_fallback", g_leg_filter_crop_fallback, true);
         this->get_parameter_or<string>("multi.leg_filter_target_frame", g_leg_filter_target_frame, "lidar_link");
+        std::string tf_base_parent_frame = "base";
+        std::string tf_base_child_frame = "camera_init";
+        this->get_parameter_or<string>("tf.base_to_camera_init.parent_frame", tf_base_parent_frame, "base");
+        this->get_parameter_or<string>("tf.base_to_camera_init.child_frame", tf_base_child_frame, "camera_init");
+        double tf_base_tx = 0.482, tf_base_ty = 0.0, tf_base_tz = 0.0453;
+        double tf_base_qx = 0.0, tf_base_qy = 0.70710678, tf_base_qz = 0.0, tf_base_qw = 0.70710678;
+        this->get_parameter_or<double>("tf.base_to_camera_init.tx", tf_base_tx, 0.482);
+        this->get_parameter_or<double>("tf.base_to_camera_init.ty", tf_base_ty, 0.0);
+        this->get_parameter_or<double>("tf.base_to_camera_init.tz", tf_base_tz, 0.0453);
+        this->get_parameter_or<double>("tf.base_to_camera_init.qx", tf_base_qx, 0.0);
+        this->get_parameter_or<double>("tf.base_to_camera_init.qy", tf_base_qy, 0.70710678);
+        this->get_parameter_or<double>("tf.base_to_camera_init.qz", tf_base_qz, 0.0);
+        this->get_parameter_or<double>("tf.base_to_camera_init.qw", tf_base_qw, 0.70710678);
         this->get_parameter_or<double>("cube_side_length",cube_len,200.f);
         this->get_parameter_or<float>("mapping.det_range",DET_RANGE,300.f);
         this->get_parameter_or<double>("mapping.fov_degree",fov_deg,180.f);
@@ -1985,16 +2000,21 @@ public:
         {
             geometry_msgs::msg::TransformStamped base_to_ci;
             base_to_ci.header.stamp = rclcpp::Time(0, 0, this->get_clock()->get_clock_type());
-            base_to_ci.header.frame_id = "base";
-            base_to_ci.child_frame_id = "camera_init";
-            base_to_ci.transform.translation.x = 0.482;
-            base_to_ci.transform.translation.y = 0.0;
-            base_to_ci.transform.translation.z = 0.0453;
-            base_to_ci.transform.rotation.w = 0.70710678;
-            base_to_ci.transform.rotation.x = 0.0;
-            base_to_ci.transform.rotation.y = 0.70710678;
-            base_to_ci.transform.rotation.z = 0.0;
+            base_to_ci.header.frame_id = tf_base_parent_frame;
+            base_to_ci.child_frame_id = tf_base_child_frame;
+            base_to_ci.transform.translation.x = tf_base_tx;
+            base_to_ci.transform.translation.y = tf_base_ty;
+            base_to_ci.transform.translation.z = tf_base_tz;
+            base_to_ci.transform.rotation.x = tf_base_qx;
+            base_to_ci.transform.rotation.y = tf_base_qy;
+            base_to_ci.transform.rotation.z = tf_base_qz;
+            base_to_ci.transform.rotation.w = tf_base_qw;
             static_tf_broadcaster_->sendTransform(base_to_ci);
+            RCLCPP_INFO(this->get_logger(),
+                "Static TF %s->%s: T=(%.4f, %.4f, %.4f), Q=(%.6f, %.6f, %.6f, %.6f)",
+                tf_base_parent_frame.c_str(), tf_base_child_frame.c_str(),
+                tf_base_tx, tf_base_ty, tf_base_tz,
+                tf_base_qx, tf_base_qy, tf_base_qz, tf_base_qw);
         }
         pubLaserCloudFull_fusion_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_lidar2_filtered", 20);  // 测试用：第二雷达裁剪+外参变换后的点云，在 timer 中发布
         pubLaserCloudRemoved_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_lidar2_removed", 20);      // 被滤掉的点云（后腿等），调试用
