@@ -53,10 +53,32 @@
             # 融合时打印「辅 header − 主 lidar_end」时间差，节流周期(ms)；0=不打印 默认值1000
             aux_sync_time_log_ms: 0 #1000
 
-            # 辅雷达并入主雷达系后：TF+胶囊剔 RL/RR 自点（需 joint_states + robot_state_publisher）
-            leg_filter_capsule_en: true
-            leg_filter_crop_fallback: true
-            leg_filter_target_frame: "lidar_link"
+            filter:
+                # 主雷达系下底部离群点裁剪盒；默认关闭，按实机安装位置再调
+                bottom_crop_en: false
+                bottom_crop_min: [ -0.35, -0.25, -0.45 ]
+                bottom_crop_max: [  0.35,  0.25, -0.10 ]
+                # 辅雷达并入主雷达系后：TF+胶囊剔四腿自点（FL/FR/RL/RR，需 joint_states + robot_state_publisher）
+                leg_capsule_en: true
+                leg_crop_fallback: true
+                leg_target_frame: "lidar_link"
+                # 四条腿大腿/小腿胶囊直径(m)
+                leg_capsule_diameter_fl_thigh: 0.18
+                leg_capsule_diameter_fl_calf: 0.14
+                leg_capsule_diameter_fr_thigh: 0.18
+                leg_capsule_diameter_fr_calf: 0.14
+                leg_capsule_diameter_rl_thigh: 0.18
+                leg_capsule_diameter_rl_calf: 0.14
+                leg_capsule_diameter_rr_thigh: 0.18
+                leg_capsule_diameter_rr_calf: 0.14
+                leg_capsule_offset_fl_thigh: [ 0.0, 0.0, 0.0 ]
+                leg_capsule_offset_fl_calf:  [ 0.0, 0.0, 0.0 ]
+                leg_capsule_offset_fr_thigh: [ 0.0, 0.0, 0.0 ]
+                leg_capsule_offset_fr_calf:  [ 0.0, 0.0, 0.0 ]
+                leg_capsule_offset_rl_thigh: [ 0.0, 0.0, 0.0 ]
+                leg_capsule_offset_rl_calf:  [ 0.0, 0.0, 0.0 ]
+                leg_capsule_offset_rr_thigh: [ 0.0, 0.0, 0.0 ]
+                leg_capsule_offset_rr_calf:  [ 0.0, 0.0, 0.0 ]
 
             # 辅路体素(m)：默认不写则与顶层 filter_size_surf 相同；0=关闭下采样
             filter_size_voxel_lidar_2: 0.1  # 0.1

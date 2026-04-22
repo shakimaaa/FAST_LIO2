@@ -2,7 +2,7 @@
     ros__parameters:
         feature_extract_enable: false
         # 精细建图：保留更多点、更小体素、更多迭代（仿真可偏激进，实机需权衡算力）
-        point_filter_num: 3                     # 1=保留最多点(最精细) 2/3/4 依次更稀疏
+        point_filter_num: 4                     # 1=保留最多点(最精细) 2/3/4 依次更稀疏
         max_iteration: 3                        # 每帧迭代次数，略增有利于收敛与细节
         filter_size_surf: 0.3                  # 匹配用体素(m)：越小匹配越细，当前偏精细
         filter_size_map: 0.3                   # 地图体素(m)：越小地图分辨率越高
@@ -11,17 +11,28 @@
         map_file_path: "./src/LIO/FAST_LIO2/PCD/test1.pcd"
 
         common:
-            lid_topic:  "/livox/lidar"    #"/mid360"
-            imu_topic:  "/livox/imu"                  #"/mid360/imu"
+            lid_topic:  "/rslidar_points"    #"/mid360"
+            imu_topic:  "/imu_tf/imu"                  #"/mid360/imu"
             time_sync_en: false         # Disabled since IMU and LiDAR now use the same simulation time base
             time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
                                         # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
             debug_info: true
+        tf:
+            base_to_camera_init:
+                parent_frame: "base"
+                child_frame: "camera_init"
+                tx: 33.4e-3     # 0.482
+                ty: -17.2765e-3 # 0.0
+                tz: 51.0469e-3  # 0.0453
+                qx: 0.0            # 0.0
+                qy: 0.0         # 0.70710678
+                qz: 0.0         # 0.0
+                qw: 1.0         # 0.70710678
 
         preprocess:
-            lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 4 for any other pointcloud input
+            lidar_type: 5                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 4 for any other pointcloud input
             scan_line:  4
-            blind: 0.5
+            blind: 0.1
             timestamp_unit: 3
             scan_rate: 10
 
@@ -35,30 +46,54 @@
             det_range:     100.0
             extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
             # Mid360 机身自带 IMU，同体 T=0。仿真中点云与 IMU 已对齐时用单位阵可得到水平点云/path
-            extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
-            extrinsic_R: [ 1., 0., 0.,
+            extrinsic_T: [ 0.385, 0.017, -0.1 ]
+            extrinsic_R: [ -0.966, 0., 0.259,
                             0., 1., 0.,
-                            0., 0., 1.]
+                            -0.259, 0., -0.966]
             # 若实机雷达 pitch 90° 安装且点云倾斜，可改用: [ 0,0,1 / 0,1,0 / -1,0,0 ]
         multi:
             # 总雷达数 1~3：1=仅主雷达；2=主+第二路；3=主+第二+第三路
             # 省略 lidar_count 时：multi_en false→1；multi_en true→2（兼容旧配置）
-            lidar_count: 2
-            multi_en: true
+            lidar_count: 1
+            multi_en: false
             removed_en: false
             # 辅帧 header 与主帧 lidar_end_time 最大允许 |dt|（秒）；<=0 不丢弃，仍取最接近帧
-            aux_time_sync_max_diff: 0.8
+            aux_time_sync_max_diff: -1.
             # 每路辅雷达队列最大帧数；<=0 不限制长度
             aux_buffer_max_size: 32
             # 融合时打印「辅 header − 主 lidar_end」时间差，节流周期(ms)；0=不打印 默认值1000
             aux_sync_time_log_ms: 0 #1000
 
-            leg_filter_capsule_en: true
-            leg_filter_crop_fallback: true
-            leg_filter_target_frame: "lidar_link"
+            filter:
+                # 主雷达系下底部离群点裁剪盒；过滤机器人腹部/底盘附近的自点与异常反射
+                bottom_crop_en: true
+                bottom_crop_min: [ -0.35, -0.25, -0.45 ]
+                bottom_crop_max: [  0.35,  0.25, -0.10 ]
+                # 辅雷达并入主雷达系后：TF+胶囊剔四腿自点（FL/FR/RL/RR，需 joint_states + robot_state_publisher）
+                leg_capsule_en: true
+                leg_crop_fallback: false
+                leg_target_frame: "lidar_link"
+                # 四条腿大腿/小腿胶囊直径(m)
+                leg_capsule_diameter_fl_thigh: 0.38          #前左大腿
+                leg_capsule_diameter_fl_calf: 0.24           #前左小腿
+                leg_capsule_diameter_fr_thigh: 0.38          #前右大腿
+                leg_capsule_diameter_fr_calf: 0.24           #前右小腿
+                leg_capsule_diameter_rl_thigh: 0.18          #后左大腿
+                leg_capsule_diameter_rl_calf: 0.18           #后左小腿
+                leg_capsule_diameter_rr_thigh: 0.18          #后右大腿
+                leg_capsule_diameter_rr_calf: 0.18           #后右小腿
+                # 四条腿大腿/小腿在 leg_target_frame 下的平移微调 offset [x, y, z] (m)
+                leg_capsule_offset_fl_thigh: [ 0.0, 0.0, 0.0 ]
+                leg_capsule_offset_fl_calf:  [ 0.0, 0.0, 0.0 ]
+                leg_capsule_offset_fr_thigh: [ 0.0, 0.0, 0.0 ]
+                leg_capsule_offset_fr_calf:  [ 0.0, 0.0, 0.0 ]
+                leg_capsule_offset_rl_thigh: [ 0.0, 0.0, 0.0 ]
+                leg_capsule_offset_rl_calf:  [ -0.1, 0.0, 0.0 ]
+                leg_capsule_offset_rr_thigh: [ 0.0, 0.0, 0.0 ]
+                leg_capsule_offset_rr_calf:  [ -0.1, 0.0, 0.0 ]
 
             # 辅路体素(m)：默认不写则与顶层 filter_size_surf 相同；0=关闭下采样
-            filter_size_voxel_lidar_2: 0.05  # 0.1
+            # filter_size_voxel_lidar_2: 0.2  # 0.1
             # filter_size_voxel_lidar_3: 0.15
 
             # ---------- 第 2 路（相对主雷达坐标系的外参）----------
@@ -87,9 +122,9 @@
         publish:
             path_en: true                # true: publish Path
             effect_map_en: false         # true: publish Effects
-            map_en: true                 # true: publish Map cloud
+            map_en: false                 # true: publish Map cloud
             scan_publish_en:  true       # false: close all the point cloud output
-            dense_publish_en: true       # true: 保存/发布地图用未降采样点云，精细建图建议 true
+            dense_publish_en: false       # true: 保存/发布地图用未降采样点云，精细建图建议 true
             scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
 
         pcd_save:

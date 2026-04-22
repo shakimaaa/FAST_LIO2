@@ -125,6 +125,9 @@ static std::shared_ptr<tf2_ros::TransformListener> g_leg_tf_listener;
 static bool g_leg_filter_capsule_en = true;
 static bool g_leg_filter_crop_fallback = true;
 static std::string g_leg_filter_target_frame = "lidar_link";
+static bool g_bottom_filter_crop_en = false;
+static Eigen::Vector3f g_bottom_filter_min = Eigen::Vector3f(-0.35f, -0.25f, -0.45f);
+static Eigen::Vector3f g_bottom_filter_max = Eigen::Vector3f( 0.35f,  0.25f, -0.10f);
 static bool g_leg_filter_tf_ready = false;
 static rclcpp::Clock::SharedPtr g_leg_log_clock;
 
@@ -356,23 +359,126 @@ static float dist_sq_point_segment(const Eigen::Vector3f& p, const Eigen::Vector
     return (p - closest).squaredNorm();
 }
 
-/** lr_pro 四套腿：连杆系内近似肢体中心线与半径；前腿与后腿左右对称沿用同一组局部线段 */
+/** lr_pro 四套腿：连杆系内近似肢体中心线；半径可由参数覆盖 */
 struct RearLegCapsuleSpec {
     const char* link_frame;
     float ax, ay, az, bx, by, bz;
     float radius;
+    float ox, oy, oz;
 };
-static const RearLegCapsuleSpec kRearLegCapsules[] = {
-    {"FL_thigh", 0.f,  0.02f, -0.02f, 0.f,  0.12f, -0.33f, 0.09f},
-    {"FL_calf",  0.f,  0.f,    -0.05f, 0.f,  0.f,    -0.32f, 0.07f},
-    {"FR_thigh", 0.f, -0.02f, -0.02f, 0.f, -0.12f, -0.33f, 0.09f},
-    {"FR_calf",  0.f,  0.f,    -0.05f, 0.f,  0.f,    -0.32f, 0.07f},
-    {"RL_thigh", 0.f,  0.02f, -0.02f, 0.f,  0.12f, -0.33f, 0.09f},
-    {"RL_calf",  0.f,  0.f,    -0.05f, 0.f,  0.f,    -0.32f, 0.07f},
-    {"RR_thigh", 0.f, -0.02f, -0.02f, 0.f, -0.12f, -0.33f, 0.09f},
-    {"RR_calf",  0.f,  0.f,    -0.05f, 0.f,  0.f,    -0.32f, 0.07f},
+static RearLegCapsuleSpec g_leg_capsules[] = {
+    {"FL_thigh", 0.f,  0.02f, -0.02f, 0.f,  0.12f, -0.33f, 0.09f, 0.f, 0.f, 0.f},
+    {"FL_calf",  0.f,  0.f,    -0.05f, 0.f,  0.f,    -0.32f, 0.07f, 0.f, 0.f, 0.f},
+    {"FR_thigh", 0.f, -0.02f, -0.02f, 0.f, -0.12f, -0.33f, 0.09f, 0.f, 0.f, 0.f},
+    {"FR_calf",  0.f,  0.f,    -0.05f, 0.f,  0.f,    -0.32f, 0.07f, 0.f, 0.f, 0.f},
+    {"RL_thigh", 0.f,  0.02f, -0.02f, 0.f,  0.12f, -0.33f, 0.09f, 0.f, 0.f, 0.f},
+    {"RL_calf",  0.f,  0.f,    -0.05f, 0.f,  0.f,    -0.32f, 0.07f, 0.f, 0.f, 0.f},
+    {"RR_thigh", 0.f, -0.02f, -0.02f, 0.f, -0.12f, -0.33f, 0.09f, 0.f, 0.f, 0.f},
+    {"RR_calf",  0.f,  0.f,    -0.05f, 0.f,  0.f,    -0.32f, 0.07f, 0.f, 0.f, 0.f},
 };
-static constexpr size_t kNumRearLegCapsules = sizeof(kRearLegCapsules) / sizeof(kRearLegCapsules[0]);
+static constexpr size_t kNumRearLegCapsules = sizeof(g_leg_capsules) / sizeof(g_leg_capsules[0]);
+
+static float get_leg_capsule_diameter_default(const char* link_frame)
+{
+    for (const auto& sp : g_leg_capsules) {
+        if (std::string(sp.link_frame) == link_frame) {
+            return sp.radius * 2.f;
+        }
+    }
+    return 0.f;
+}
+
+static void set_leg_capsule_diameter(const std::string& link_frame, double diameter)
+{
+    if (diameter <= 0.0) return;
+    for (auto& sp : g_leg_capsules) {
+        if (link_frame == sp.link_frame) {
+            sp.radius = static_cast<float>(0.5 * diameter);
+            return;
+        }
+    }
+}
+
+static void set_leg_capsule_offset(const std::string& link_frame, const vector<double>& offset)
+{
+    if (offset.size() != 3) return;
+    for (auto& sp : g_leg_capsules) {
+        if (link_frame == sp.link_frame) {
+            sp.ox = static_cast<float>(offset[0]);
+            sp.oy = static_cast<float>(offset[1]);
+            sp.oz = static_cast<float>(offset[2]);
+            return;
+        }
+    }
+}
+
+static void set_bottom_filter_bounds(const vector<double>& min_xyz, const vector<double>& max_xyz)
+{
+    if (min_xyz.size() == 3) {
+        g_bottom_filter_min = Eigen::Vector3f(
+            static_cast<float>(min_xyz[0]),
+            static_cast<float>(min_xyz[1]),
+            static_cast<float>(min_xyz[2]));
+    }
+    if (max_xyz.size() == 3) {
+        g_bottom_filter_max = Eigen::Vector3f(
+            static_cast<float>(max_xyz[0]),
+            static_cast<float>(max_xyz[1]),
+            static_cast<float>(max_xyz[2]));
+    }
+}
+
+/** 主雷达系下底部离群点 CropBox；用于裁掉机器人腹部/底盘附近的自点或反射离群点 */
+static void filter_bottom_outliers_cropbox(const PointCloudXYZI::Ptr& input,
+    PointCloudXYZI::Ptr& output,
+    PointCloudXYZI::Ptr removed_out)
+{
+    if (!input || input->empty()) {
+        if (output) output->clear();
+        return;
+    }
+
+    PointCloudXYZI::Ptr input_fixed(new PointCloudXYZI());
+    *input_fixed = *input;
+    if (input_fixed->width == 0 && !input_fixed->empty()) {
+        input_fixed->width = input_fixed->size();
+        input_fixed->height = 1;
+    }
+
+    pcl::CropBox<PointType> crop_bottom;
+    crop_bottom.setInputCloud(input_fixed);
+    crop_bottom.setMin(Eigen::Vector4f(
+        g_bottom_filter_min.x(), g_bottom_filter_min.y(), g_bottom_filter_min.z(), 1.0f));
+    crop_bottom.setMax(Eigen::Vector4f(
+        g_bottom_filter_max.x(), g_bottom_filter_max.y(), g_bottom_filter_max.z(), 1.0f));
+    crop_bottom.setNegative(true);
+    crop_bottom.filter(*output);
+
+    if (removed_en && removed_out) {
+        PointCloudXYZI::Ptr removed_bottom(new PointCloudXYZI());
+        pcl::CropBox<PointType> box_bottom;
+        box_bottom.setInputCloud(input_fixed);
+        box_bottom.setMin(Eigen::Vector4f(
+            g_bottom_filter_min.x(), g_bottom_filter_min.y(), g_bottom_filter_min.z(), 1.0f));
+        box_bottom.setMax(Eigen::Vector4f(
+            g_bottom_filter_max.x(), g_bottom_filter_max.y(), g_bottom_filter_max.z(), 1.0f));
+        box_bottom.setNegative(false);
+        box_bottom.filter(*removed_bottom);
+        *removed_out += *removed_bottom;
+        removed_out->width = removed_out->empty() ? 0 : static_cast<uint32_t>(removed_out->size());
+        removed_out->height = 1;
+    }
+
+    if (removed_en) {
+        static int _dbg_bottom = 0;
+        if (++_dbg_bottom % 50 == 0) {
+            const size_t in_sz = input_fixed->size(), out_sz = output->size();
+            RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                "[filter_bottom] cropbox in=%zu out=%zu removed=%zu",
+                in_sz, out_sz, in_sz > out_sz ? in_sz - out_sz : 0);
+        }
+    }
+}
 
 static bool filter_rear_legs_capsule_tf(const PointCloudXYZI::Ptr& input_fixed,
     PointCloudXYZI::Ptr& output,
@@ -390,7 +496,7 @@ static bool filter_rear_legs_capsule_tf(const PointCloudXYZI::Ptr& input_fixed,
 
     try {
         for (size_t i = 0; i < kNumRearLegCapsules; ++i) {
-            const RearLegCapsuleSpec& sp = kRearLegCapsules[i];
+            const RearLegCapsuleSpec& sp = g_leg_capsules[i];
             geometry_msgs::msg::TransformStamped st;
             try {
                 st = g_leg_tf_buffer->lookupTransform(g_leg_filter_target_frame, sp.link_frame, tp_try);
@@ -398,8 +504,9 @@ static bool filter_rear_legs_capsule_tf(const PointCloudXYZI::Ptr& input_fixed,
                 st = g_leg_tf_buffer->lookupTransform(g_leg_filter_target_frame, sp.link_frame, tf2::TimePointZero);
             }
             const Eigen::Isometry3d Te = tf2::transformToEigen(st.transform);
-            const Eigen::Vector3d ad = Te * Eigen::Vector3d(sp.ax, sp.ay, sp.az);
-            const Eigen::Vector3d bd = Te * Eigen::Vector3d(sp.bx, sp.by, sp.bz);
+            const Eigen::Vector3d offset(sp.ox, sp.oy, sp.oz);
+            const Eigen::Vector3d ad = Te * Eigen::Vector3d(sp.ax, sp.ay, sp.az) + offset;
+            const Eigen::Vector3d bd = Te * Eigen::Vector3d(sp.bx, sp.by, sp.bz) + offset;
             a_w[i] = ad.cast<float>();
             b_w[i] = bd.cast<float>();
             r2[i] = sp.radius * sp.radius;
@@ -568,15 +675,22 @@ void filter_rear_legs_lidar1(const PointCloudXYZI::Ptr& input,
         input_fixed->height = 1;
     }
 
+    if (removed_out) removed_out->clear();
+
+    PointCloudXYZI::Ptr working(new PointCloudXYZI());
     if (g_leg_filter_capsule_en &&
-        filter_rear_legs_capsule_tf(input_fixed, output, removed_out, header_stamp_sec)) {
-        return;
-    }
-    if (g_leg_filter_crop_fallback) {
-        filter_rear_legs_cropbox(input, output, removed_out);
+        filter_rear_legs_capsule_tf(input_fixed, working, removed_out, header_stamp_sec)) {
+        // pass
+    } else if (g_leg_filter_crop_fallback) {
+        filter_rear_legs_cropbox(input_fixed, working, removed_out);
     } else {
-        *output = *input_fixed;
-        if (removed_out) removed_out->clear();
+        *working = *input_fixed;
+    }
+
+    if (g_bottom_filter_crop_en) {
+        filter_bottom_outliers_cropbox(working, output, removed_out);
+    } else {
+        *output = *working;
     }
 }
 
@@ -1566,6 +1680,60 @@ public:
         this->declare_parameter<bool>("multi.leg_filter_capsule_en", true);
         this->declare_parameter<bool>("multi.leg_filter_crop_fallback", true);
         this->declare_parameter<string>("multi.leg_filter_target_frame", "lidar_link");
+        this->declare_parameter<bool>("multi.filter.leg_capsule_en", true);
+        this->declare_parameter<bool>("multi.filter.leg_crop_fallback", true);
+        this->declare_parameter<string>("multi.filter.leg_target_frame", "lidar_link");
+        this->declare_parameter<bool>("multi.filter.bottom_crop_en", false);
+        this->declare_parameter<vector<double>>("multi.filter.bottom_crop_min", vector<double>{-0.35, -0.25, -0.45});
+        this->declare_parameter<vector<double>>("multi.filter.bottom_crop_max", vector<double>{ 0.35,  0.25, -0.10});
+        this->declare_parameter<double>("multi.leg_filter_capsule_diameter_fl_thigh",
+            static_cast<double>(get_leg_capsule_diameter_default("FL_thigh")));
+        this->declare_parameter<double>("multi.leg_filter_capsule_diameter_fl_calf",
+            static_cast<double>(get_leg_capsule_diameter_default("FL_calf")));
+        this->declare_parameter<double>("multi.leg_filter_capsule_diameter_fr_thigh",
+            static_cast<double>(get_leg_capsule_diameter_default("FR_thigh")));
+        this->declare_parameter<double>("multi.leg_filter_capsule_diameter_fr_calf",
+            static_cast<double>(get_leg_capsule_diameter_default("FR_calf")));
+        this->declare_parameter<double>("multi.leg_filter_capsule_diameter_rl_thigh",
+            static_cast<double>(get_leg_capsule_diameter_default("RL_thigh")));
+        this->declare_parameter<double>("multi.leg_filter_capsule_diameter_rl_calf",
+            static_cast<double>(get_leg_capsule_diameter_default("RL_calf")));
+        this->declare_parameter<double>("multi.leg_filter_capsule_diameter_rr_thigh",
+            static_cast<double>(get_leg_capsule_diameter_default("RR_thigh")));
+        this->declare_parameter<double>("multi.leg_filter_capsule_diameter_rr_calf",
+            static_cast<double>(get_leg_capsule_diameter_default("RR_calf")));
+        this->declare_parameter<double>("multi.filter.leg_capsule_diameter_fl_thigh",
+            static_cast<double>(get_leg_capsule_diameter_default("FL_thigh")));
+        this->declare_parameter<double>("multi.filter.leg_capsule_diameter_fl_calf",
+            static_cast<double>(get_leg_capsule_diameter_default("FL_calf")));
+        this->declare_parameter<double>("multi.filter.leg_capsule_diameter_fr_thigh",
+            static_cast<double>(get_leg_capsule_diameter_default("FR_thigh")));
+        this->declare_parameter<double>("multi.filter.leg_capsule_diameter_fr_calf",
+            static_cast<double>(get_leg_capsule_diameter_default("FR_calf")));
+        this->declare_parameter<double>("multi.filter.leg_capsule_diameter_rl_thigh",
+            static_cast<double>(get_leg_capsule_diameter_default("RL_thigh")));
+        this->declare_parameter<double>("multi.filter.leg_capsule_diameter_rl_calf",
+            static_cast<double>(get_leg_capsule_diameter_default("RL_calf")));
+        this->declare_parameter<double>("multi.filter.leg_capsule_diameter_rr_thigh",
+            static_cast<double>(get_leg_capsule_diameter_default("RR_thigh")));
+        this->declare_parameter<double>("multi.filter.leg_capsule_diameter_rr_calf",
+            static_cast<double>(get_leg_capsule_diameter_default("RR_calf")));
+        this->declare_parameter<vector<double>>("multi.leg_filter_capsule_offset_fl_thigh", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.leg_filter_capsule_offset_fl_calf", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.leg_filter_capsule_offset_fr_thigh", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.leg_filter_capsule_offset_fr_calf", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.leg_filter_capsule_offset_rl_thigh", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.leg_filter_capsule_offset_rl_calf", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.leg_filter_capsule_offset_rr_thigh", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.leg_filter_capsule_offset_rr_calf", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.filter.leg_capsule_offset_fl_thigh", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.filter.leg_capsule_offset_fl_calf", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.filter.leg_capsule_offset_fr_thigh", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.filter.leg_capsule_offset_fr_calf", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.filter.leg_capsule_offset_rl_thigh", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.filter.leg_capsule_offset_rl_calf", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.filter.leg_capsule_offset_rr_thigh", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.filter.leg_capsule_offset_rr_calf", vector<double>{0.0, 0.0, 0.0});
         this->declare_parameter<string>("tf.base_to_camera_init.parent_frame", "base");
         this->declare_parameter<string>("tf.base_to_camera_init.child_frame", "camera_init");
         this->declare_parameter<double>("tf.base_to_camera_init.tx", 0.482);
@@ -1603,6 +1771,113 @@ public:
         this->get_parameter_or<bool>("multi.leg_filter_capsule_en", g_leg_filter_capsule_en, true);
         this->get_parameter_or<bool>("multi.leg_filter_crop_fallback", g_leg_filter_crop_fallback, true);
         this->get_parameter_or<string>("multi.leg_filter_target_frame", g_leg_filter_target_frame, "lidar_link");
+        this->get_parameter_or<bool>("multi.filter.leg_capsule_en", g_leg_filter_capsule_en, g_leg_filter_capsule_en);
+        this->get_parameter_or<bool>("multi.filter.leg_crop_fallback", g_leg_filter_crop_fallback, g_leg_filter_crop_fallback);
+        this->get_parameter_or<string>("multi.filter.leg_target_frame", g_leg_filter_target_frame, g_leg_filter_target_frame);
+        vector<double> bottom_crop_min{-0.35, -0.25, -0.45};
+        vector<double> bottom_crop_max{ 0.35,  0.25, -0.10};
+        this->get_parameter_or<bool>("multi.filter.bottom_crop_en", g_bottom_filter_crop_en, false);
+        this->get_parameter_or<vector<double>>("multi.filter.bottom_crop_min",
+            bottom_crop_min, bottom_crop_min);
+        this->get_parameter_or<vector<double>>("multi.filter.bottom_crop_max",
+            bottom_crop_max, bottom_crop_max);
+        set_bottom_filter_bounds(bottom_crop_min, bottom_crop_max);
+        double leg_capsule_diameter_fl_thigh = static_cast<double>(get_leg_capsule_diameter_default("FL_thigh"));
+        double leg_capsule_diameter_fl_calf = static_cast<double>(get_leg_capsule_diameter_default("FL_calf"));
+        double leg_capsule_diameter_fr_thigh = static_cast<double>(get_leg_capsule_diameter_default("FR_thigh"));
+        double leg_capsule_diameter_fr_calf = static_cast<double>(get_leg_capsule_diameter_default("FR_calf"));
+        double leg_capsule_diameter_rl_thigh = static_cast<double>(get_leg_capsule_diameter_default("RL_thigh"));
+        double leg_capsule_diameter_rl_calf = static_cast<double>(get_leg_capsule_diameter_default("RL_calf"));
+        double leg_capsule_diameter_rr_thigh = static_cast<double>(get_leg_capsule_diameter_default("RR_thigh"));
+        double leg_capsule_diameter_rr_calf = static_cast<double>(get_leg_capsule_diameter_default("RR_calf"));
+        vector<double> leg_capsule_offset_fl_thigh{0.0, 0.0, 0.0};
+        vector<double> leg_capsule_offset_fl_calf{0.0, 0.0, 0.0};
+        vector<double> leg_capsule_offset_fr_thigh{0.0, 0.0, 0.0};
+        vector<double> leg_capsule_offset_fr_calf{0.0, 0.0, 0.0};
+        vector<double> leg_capsule_offset_rl_thigh{0.0, 0.0, 0.0};
+        vector<double> leg_capsule_offset_rl_calf{0.0, 0.0, 0.0};
+        vector<double> leg_capsule_offset_rr_thigh{0.0, 0.0, 0.0};
+        vector<double> leg_capsule_offset_rr_calf{0.0, 0.0, 0.0};
+        this->get_parameter_or<double>("multi.leg_filter_capsule_diameter_fl_thigh",
+            leg_capsule_diameter_fl_thigh, leg_capsule_diameter_fl_thigh);
+        this->get_parameter_or<double>("multi.leg_filter_capsule_diameter_fl_calf",
+            leg_capsule_diameter_fl_calf, leg_capsule_diameter_fl_calf);
+        this->get_parameter_or<double>("multi.leg_filter_capsule_diameter_fr_thigh",
+            leg_capsule_diameter_fr_thigh, leg_capsule_diameter_fr_thigh);
+        this->get_parameter_or<double>("multi.leg_filter_capsule_diameter_fr_calf",
+            leg_capsule_diameter_fr_calf, leg_capsule_diameter_fr_calf);
+        this->get_parameter_or<double>("multi.leg_filter_capsule_diameter_rl_thigh",
+            leg_capsule_diameter_rl_thigh, leg_capsule_diameter_rl_thigh);
+        this->get_parameter_or<double>("multi.leg_filter_capsule_diameter_rl_calf",
+            leg_capsule_diameter_rl_calf, leg_capsule_diameter_rl_calf);
+        this->get_parameter_or<double>("multi.leg_filter_capsule_diameter_rr_thigh",
+            leg_capsule_diameter_rr_thigh, leg_capsule_diameter_rr_thigh);
+        this->get_parameter_or<double>("multi.leg_filter_capsule_diameter_rr_calf",
+            leg_capsule_diameter_rr_calf, leg_capsule_diameter_rr_calf);
+        this->get_parameter_or<double>("multi.filter.leg_capsule_diameter_fl_thigh",
+            leg_capsule_diameter_fl_thigh, leg_capsule_diameter_fl_thigh);
+        this->get_parameter_or<double>("multi.filter.leg_capsule_diameter_fl_calf",
+            leg_capsule_diameter_fl_calf, leg_capsule_diameter_fl_calf);
+        this->get_parameter_or<double>("multi.filter.leg_capsule_diameter_fr_thigh",
+            leg_capsule_diameter_fr_thigh, leg_capsule_diameter_fr_thigh);
+        this->get_parameter_or<double>("multi.filter.leg_capsule_diameter_fr_calf",
+            leg_capsule_diameter_fr_calf, leg_capsule_diameter_fr_calf);
+        this->get_parameter_or<double>("multi.filter.leg_capsule_diameter_rl_thigh",
+            leg_capsule_diameter_rl_thigh, leg_capsule_diameter_rl_thigh);
+        this->get_parameter_or<double>("multi.filter.leg_capsule_diameter_rl_calf",
+            leg_capsule_diameter_rl_calf, leg_capsule_diameter_rl_calf);
+        this->get_parameter_or<double>("multi.filter.leg_capsule_diameter_rr_thigh",
+            leg_capsule_diameter_rr_thigh, leg_capsule_diameter_rr_thigh);
+        this->get_parameter_or<double>("multi.filter.leg_capsule_diameter_rr_calf",
+            leg_capsule_diameter_rr_calf, leg_capsule_diameter_rr_calf);
+        this->get_parameter_or<vector<double>>("multi.leg_filter_capsule_offset_fl_thigh",
+            leg_capsule_offset_fl_thigh, vector<double>{0.0, 0.0, 0.0});
+        this->get_parameter_or<vector<double>>("multi.leg_filter_capsule_offset_fl_calf",
+            leg_capsule_offset_fl_calf, vector<double>{0.0, 0.0, 0.0});
+        this->get_parameter_or<vector<double>>("multi.leg_filter_capsule_offset_fr_thigh",
+            leg_capsule_offset_fr_thigh, vector<double>{0.0, 0.0, 0.0});
+        this->get_parameter_or<vector<double>>("multi.leg_filter_capsule_offset_fr_calf",
+            leg_capsule_offset_fr_calf, vector<double>{0.0, 0.0, 0.0});
+        this->get_parameter_or<vector<double>>("multi.leg_filter_capsule_offset_rl_thigh",
+            leg_capsule_offset_rl_thigh, vector<double>{0.0, 0.0, 0.0});
+        this->get_parameter_or<vector<double>>("multi.leg_filter_capsule_offset_rl_calf",
+            leg_capsule_offset_rl_calf, vector<double>{0.0, 0.0, 0.0});
+        this->get_parameter_or<vector<double>>("multi.leg_filter_capsule_offset_rr_thigh",
+            leg_capsule_offset_rr_thigh, vector<double>{0.0, 0.0, 0.0});
+        this->get_parameter_or<vector<double>>("multi.leg_filter_capsule_offset_rr_calf",
+            leg_capsule_offset_rr_calf, vector<double>{0.0, 0.0, 0.0});
+        this->get_parameter_or<vector<double>>("multi.filter.leg_capsule_offset_fl_thigh",
+            leg_capsule_offset_fl_thigh, leg_capsule_offset_fl_thigh);
+        this->get_parameter_or<vector<double>>("multi.filter.leg_capsule_offset_fl_calf",
+            leg_capsule_offset_fl_calf, leg_capsule_offset_fl_calf);
+        this->get_parameter_or<vector<double>>("multi.filter.leg_capsule_offset_fr_thigh",
+            leg_capsule_offset_fr_thigh, leg_capsule_offset_fr_thigh);
+        this->get_parameter_or<vector<double>>("multi.filter.leg_capsule_offset_fr_calf",
+            leg_capsule_offset_fr_calf, leg_capsule_offset_fr_calf);
+        this->get_parameter_or<vector<double>>("multi.filter.leg_capsule_offset_rl_thigh",
+            leg_capsule_offset_rl_thigh, leg_capsule_offset_rl_thigh);
+        this->get_parameter_or<vector<double>>("multi.filter.leg_capsule_offset_rl_calf",
+            leg_capsule_offset_rl_calf, leg_capsule_offset_rl_calf);
+        this->get_parameter_or<vector<double>>("multi.filter.leg_capsule_offset_rr_thigh",
+            leg_capsule_offset_rr_thigh, leg_capsule_offset_rr_thigh);
+        this->get_parameter_or<vector<double>>("multi.filter.leg_capsule_offset_rr_calf",
+            leg_capsule_offset_rr_calf, leg_capsule_offset_rr_calf);
+        set_leg_capsule_diameter("FL_thigh", leg_capsule_diameter_fl_thigh);
+        set_leg_capsule_diameter("FL_calf", leg_capsule_diameter_fl_calf);
+        set_leg_capsule_diameter("FR_thigh", leg_capsule_diameter_fr_thigh);
+        set_leg_capsule_diameter("FR_calf", leg_capsule_diameter_fr_calf);
+        set_leg_capsule_diameter("RL_thigh", leg_capsule_diameter_rl_thigh);
+        set_leg_capsule_diameter("RL_calf", leg_capsule_diameter_rl_calf);
+        set_leg_capsule_diameter("RR_thigh", leg_capsule_diameter_rr_thigh);
+        set_leg_capsule_diameter("RR_calf", leg_capsule_diameter_rr_calf);
+        set_leg_capsule_offset("FL_thigh", leg_capsule_offset_fl_thigh);
+        set_leg_capsule_offset("FL_calf", leg_capsule_offset_fl_calf);
+        set_leg_capsule_offset("FR_thigh", leg_capsule_offset_fr_thigh);
+        set_leg_capsule_offset("FR_calf", leg_capsule_offset_fr_calf);
+        set_leg_capsule_offset("RL_thigh", leg_capsule_offset_rl_thigh);
+        set_leg_capsule_offset("RL_calf", leg_capsule_offset_rl_calf);
+        set_leg_capsule_offset("RR_thigh", leg_capsule_offset_rr_thigh);
+        set_leg_capsule_offset("RR_calf", leg_capsule_offset_rr_calf);
         std::string tf_base_parent_frame = "base";
         std::string tf_base_child_frame = "camera_init";
         this->get_parameter_or<string>("tf.base_to_camera_init.parent_frame", tf_base_parent_frame, "base");
@@ -1761,6 +2036,13 @@ public:
             RCLCPP_INFO(this->get_logger(), "%sfilter_size_surf_min%s: %s%.3f%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, filter_size_surf_min, COLOR_RESET);
             RCLCPP_INFO(this->get_logger(), "%sfilter_size_map_min%s: %s%.3f%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, filter_size_map_min, COLOR_RESET);
             RCLCPP_INFO(this->get_logger(), "%sfilter_size_aux_voxel[0/1]%s: %s%.4f / %.4f (0=off)%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, filter_size_aux_voxel[0], filter_size_aux_voxel[1], COLOR_RESET);
+            RCLCPP_INFO(this->get_logger(), "%sbottom_crop_en%s: %s%s%s", COLOR_ITEM, COLOR_RESET, g_bottom_filter_crop_en ? COLOR_BOOL_ON : COLOR_BOOL_OFF, g_bottom_filter_crop_en ? "true" : "false", COLOR_RESET);
+            RCLCPP_INFO(this->get_logger(), "%sbottom_crop_min%s: %s[%.3f, %.3f, %.3f]%s",
+                COLOR_ITEM, COLOR_RESET, COLOR_NUMBER,
+                g_bottom_filter_min.x(), g_bottom_filter_min.y(), g_bottom_filter_min.z(), COLOR_RESET);
+            RCLCPP_INFO(this->get_logger(), "%sbottom_crop_max%s: %s[%.3f, %.3f, %.3f]%s",
+                COLOR_ITEM, COLOR_RESET, COLOR_NUMBER,
+                g_bottom_filter_max.x(), g_bottom_filter_max.y(), g_bottom_filter_max.z(), COLOR_RESET);
             RCLCPP_INFO(this->get_logger(), "%scube_len%s: %s%.3f%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, cube_len, COLOR_RESET);    
             RCLCPP_INFO(this->get_logger(), "%sDET_RANGE%s: %s%.3f%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, DET_RANGE, COLOR_RESET);
             RCLCPP_INFO(this->get_logger(), "%sfov_deg%s: %s%.3f%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, fov_deg, COLOR_RESET);
@@ -1949,6 +2231,7 @@ public:
             pcl_livox_options_3.callback_group = pcl_livoxcallback_group_3;
         rclcpp::SubscriptionOptions imu_options;
             imu_options.callback_group = imu_callback_group_;
+        auto reliable_pointcloud_qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
         // rclcpp::SubscriptionOptions timer_options;
         //     timer_options.callback_group = timer_callback_group_;
 
@@ -1962,7 +2245,7 @@ public:
             else
             {
                 sub_pcl_pc_2_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-                    lid_topic_2, rclcpp::SensorDataQoS(), standard_pcl_cbk2, pcl_options_2);
+                    lid_topic_2, reliable_pointcloud_qos, standard_pcl_cbk2, pcl_options_2);
             }
         }
         if (lidar_count >= 3 && p_pre_aux[1])
@@ -1975,7 +2258,7 @@ public:
             else
             {
                 sub_pcl_pc_3_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-                    lid_topic_3, rclcpp::SensorDataQoS(), standard_pcl_cbk3, pcl_options_3);
+                    lid_topic_3, reliable_pointcloud_qos, standard_pcl_cbk3, pcl_options_3);
             }
         }
         if (p_pre->lidar_type == AVIA)
@@ -1984,7 +2267,7 @@ public:
         }
         else
         {
-            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk, pcl_options);
+            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, reliable_pointcloud_qos, standard_pcl_cbk, pcl_options);
         }
 
         

@@ -48,9 +48,29 @@
             extrinsic_R: [ 0.25978189, 0.0,   0.96566732,
                                   0.0,        1.0,   0.0,
                                  -0.96566732, 0.0,   0.25978189 ]
-            leg_filter_capsule_en: true
-            leg_filter_crop_fallback: true
-            leg_filter_target_frame: "lidar_link"
+            filter:
+                bottom_crop_en: false
+                bottom_crop_min: [ -0.35, -0.25, -0.45 ]
+                bottom_crop_max: [  0.35,  0.25, -0.10 ]
+                leg_capsule_en: true
+                leg_crop_fallback: true
+                leg_target_frame: "lidar_link"
+                leg_capsule_diameter_fl_thigh: 0.18
+                leg_capsule_diameter_fl_calf: 0.14
+                leg_capsule_diameter_fr_thigh: 0.18
+                leg_capsule_diameter_fr_calf: 0.14
+                leg_capsule_diameter_rl_thigh: 0.18
+                leg_capsule_diameter_rl_calf: 0.14
+                leg_capsule_diameter_rr_thigh: 0.18
+                leg_capsule_diameter_rr_calf: 0.14
+                leg_capsule_offset_fl_thigh: [ 0.0, 0.0, 0.0 ]
+                leg_capsule_offset_fl_calf:  [ 0.0, 0.0, 0.0 ]
+                leg_capsule_offset_fr_thigh: [ 0.0, 0.0, 0.0 ]
+                leg_capsule_offset_fr_calf:  [ 0.0, 0.0, 0.0 ]
+                leg_capsule_offset_rl_thigh: [ 0.0, 0.0, 0.0 ]
+                leg_capsule_offset_rl_calf:  [ 0.0, 0.0, 0.0 ]
+                leg_capsule_offset_rr_thigh: [ 0.0, 0.0, 0.0 ]
+                leg_capsule_offset_rr_calf:  [ 0.0, 0.0, 0.0 ]
 
         publish:
             path_en: true                # true: publish Path
