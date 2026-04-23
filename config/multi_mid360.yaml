@@ -19,7 +19,7 @@
             debug_info: true
         tf:
             base_to_camera_init:
-                parent_frame: "base"
+                parent_frame: "base_link"
                 child_frame: "camera_init"
                 tx: 33.4e-3     # 0.482
                 ty: -17.2765e-3 # 0.0
@@ -69,10 +69,24 @@
                 bottom_crop_en: true
                 bottom_crop_min: [ -0.35, -0.25, -0.45 ]
                 bottom_crop_max: [  0.35,  0.25, -0.10 ]
-                # 辅雷达并入主雷达系后：TF+胶囊剔四腿自点（FL/FR/RL/RR，需 joint_states + robot_state_publisher）
+                # 辅雷达并入主雷达系后：TF+几何过滤剔四腿自点与遮挡扇区边缘噪声（需 joint_states + robot_state_publisher）
                 leg_capsule_en: true
+                leg_sector_en: true
+                leg_sector_marker_en: true        # 是否发布足端楔形区域的 RViz MarkerArray（话题：/leg_sector_markers）
                 leg_crop_fallback: false
                 leg_target_frame: "lidar_link"
+                leg_sector_marker_frame: "camera_init"  # Marker 显示坐标系，可改为 camera_init / base / lidar_link
+                # 方案一：以四个足端(FL/FR/RL/RR_foot)在 lidar_link 下的位置为顶点，起始边始终与 x 轴平行，再朝腿外侧扫出楔形过滤区
+                leg_sector_angle_margin_deg: 40.0    # 从“与 x 轴平行的起始边”扫出的角度(度)；左腿朝 +y 扫，右腿朝 -y 扫
+                leg_sector_range_extension: 0.8     # 从足端顶点沿楔形边界向外延伸的距离(m)
+                leg_sector_near_margin: 0.03         # 允许在足端顶点后方(朝雷达一侧)保留的缓冲距离(m)
+                leg_sector_z_margin_up: 0.10         # 相对足端高度向上扩的范围(m)
+                leg_sector_z_margin_down: 0.45       # 相对足端高度向下扩的范围(m)，主要影响地面边缘噪声
+                # 四个足端扇形顶点在 leg_target_frame(lidar_link) 下的平移微调 offset [x, y, z] (m)
+                leg_sector_offset_fl_foot: [ -0.12, -0., 0.0 ]   # 前左足端扇形顶点；x>0 表示往前移
+                leg_sector_offset_fr_foot: [ -0.12, 0., 0.0 ]   # 前右足端扇形顶点；x>0 表示往前移
+                leg_sector_offset_rl_foot: [ -0.1, -0.05, 0.0 ]   # 后左足端扇形顶点
+                leg_sector_offset_rr_foot: [ -0.1, 0.05, 0.0 ]   # 后右足端扇形顶点
                 # 四条腿大腿/小腿胶囊直径(m)
                 leg_capsule_diameter_fl_thigh: 0.38          #前左大腿
                 leg_capsule_diameter_fl_calf: 0.24           #前左小腿
@@ -83,14 +97,14 @@
                 leg_capsule_diameter_rr_thigh: 0.18          #后右大腿
                 leg_capsule_diameter_rr_calf: 0.18           #后右小腿
                 # 四条腿大腿/小腿在 leg_target_frame 下的平移微调 offset [x, y, z] (m)
-                leg_capsule_offset_fl_thigh: [ 0.0, 0.0, 0.0 ]
-                leg_capsule_offset_fl_calf:  [ 0.0, 0.0, 0.0 ]
-                leg_capsule_offset_fr_thigh: [ 0.0, 0.0, 0.0 ]
-                leg_capsule_offset_fr_calf:  [ 0.0, 0.0, 0.0 ]
-                leg_capsule_offset_rl_thigh: [ 0.0, 0.0, 0.0 ]
-                leg_capsule_offset_rl_calf:  [ -0.1, 0.0, 0.0 ]
-                leg_capsule_offset_rr_thigh: [ 0.0, 0.0, 0.0 ]
-                leg_capsule_offset_rr_calf:  [ -0.1, 0.0, 0.0 ]
+                leg_capsule_offset_fl_thigh: [ 0.0, 0.0, 0.0 ]  #左大腿
+                leg_capsule_offset_fl_calf:  [ -0.1, 0.0, 0.0 ]  #左小腿
+                leg_capsule_offset_fr_thigh: [ 0.0, 0.0, 0.0 ]  #右大腿
+                leg_capsule_offset_fr_calf:  [ -0.1, 0.0, 0.0 ]  #右小腿
+                leg_capsule_offset_rl_thigh: [ 0.0, 0.0, 0.0 ]  #后左大腿
+                leg_capsule_offset_rl_calf:  [ -0.1, 0.0, 0.0 ]  #后左小腿
+                leg_capsule_offset_rr_thigh: [ 0.0, 0.0, 0.0 ]  #后右大腿
+                leg_capsule_offset_rr_calf:  [ -0.1, 0.0, 0.0 ] #后右小腿
 
             # 辅路体素(m)：默认不写则与顶层 filter_size_surf 相同；0=关闭下采样
             # filter_size_voxel_lidar_2: 0.2  # 0.1

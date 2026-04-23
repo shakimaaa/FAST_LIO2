@@ -50,6 +50,7 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <visualization_msgs/msg/marker.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -123,11 +124,19 @@ bool   removed_en = false; // whether to publish removed points
 static std::shared_ptr<tf2_ros::Buffer> g_leg_tf_buffer;
 static std::shared_ptr<tf2_ros::TransformListener> g_leg_tf_listener;
 static bool g_leg_filter_capsule_en = true;
+static bool g_leg_filter_sector_en = false;
+static bool g_leg_sector_marker_en = false;
 static bool g_leg_filter_crop_fallback = true;
 static std::string g_leg_filter_target_frame = "lidar_link";
+static std::string g_leg_sector_marker_frame = "lidar_link";
 static bool g_bottom_filter_crop_en = false;
 static Eigen::Vector3f g_bottom_filter_min = Eigen::Vector3f(-0.35f, -0.25f, -0.45f);
 static Eigen::Vector3f g_bottom_filter_max = Eigen::Vector3f( 0.35f,  0.25f, -0.10f);
+static float g_leg_sector_angle_margin_rad = static_cast<float>(4.0 * M_PI / 180.0);
+static float g_leg_sector_range_extension = 1.0f;
+static float g_leg_sector_near_margin = 0.03f;
+static float g_leg_sector_z_margin_up = 0.10f;
+static float g_leg_sector_z_margin_down = 0.40f;
 static bool g_leg_filter_tf_ready = false;
 static rclcpp::Clock::SharedPtr g_leg_log_clock;
 
@@ -377,6 +386,12 @@ static RearLegCapsuleSpec g_leg_capsules[] = {
     {"RR_calf",  0.f,  0.f,    -0.05f, 0.f,  0.f,    -0.32f, 0.07f, 0.f, 0.f, 0.f},
 };
 static constexpr size_t kNumRearLegCapsules = sizeof(g_leg_capsules) / sizeof(g_leg_capsules[0]);
+static const char* g_leg_foot_frames[] = {"FL_foot", "FR_foot", "RL_foot", "RR_foot"};
+static constexpr size_t kNumLegFeet = sizeof(g_leg_foot_frames) / sizeof(g_leg_foot_frames[0]);
+static Eigen::Vector3f g_leg_sector_offsets[kNumLegFeet] = {
+    Eigen::Vector3f::Zero(), Eigen::Vector3f::Zero(),
+    Eigen::Vector3f::Zero(), Eigen::Vector3f::Zero()
+};
 
 static float get_leg_capsule_diameter_default(const char* link_frame)
 {
@@ -412,6 +427,20 @@ static void set_leg_capsule_offset(const std::string& link_frame, const vector<d
     }
 }
 
+static void set_leg_sector_offset(const std::string& foot_frame, const vector<double>& offset)
+{
+    if (offset.size() != 3) return;
+    for (size_t i = 0; i < kNumLegFeet; ++i) {
+        if (foot_frame == g_leg_foot_frames[i]) {
+            g_leg_sector_offsets[i] = Eigen::Vector3f(
+                static_cast<float>(offset[0]),
+                static_cast<float>(offset[1]),
+                static_cast<float>(offset[2]));
+            return;
+        }
+    }
+}
+
 static void set_bottom_filter_bounds(const vector<double>& min_xyz, const vector<double>& max_xyz)
 {
     if (min_xyz.size() == 3) {
@@ -426,6 +455,46 @@ static void set_bottom_filter_bounds(const vector<double>& min_xyz, const vector
             static_cast<float>(max_xyz[1]),
             static_cast<float>(max_xyz[2]));
     }
+}
+
+static float wrap_angle_pi(float angle)
+{
+    while (angle > static_cast<float>(M_PI)) angle -= static_cast<float>(2.0 * M_PI);
+    while (angle <= static_cast<float>(-M_PI)) angle += static_cast<float>(2.0 * M_PI);
+    return angle;
+}
+
+static float cross_2d(const Eigen::Vector2f& a, const Eigen::Vector2f& b)
+{
+    return a.x() * b.y() - a.y() * b.x();
+}
+
+static Eigen::Vector2f leg_sector_start_dir_from_apex(const Eigen::Vector3f& apex)
+{
+    return Eigen::Vector2f(apex.x() >= 0.0f ? 1.0f : -1.0f, 0.0f);
+}
+
+static float leg_sector_sweep_sign_from_apex(const Eigen::Vector3f& apex)
+{
+    return apex.y() >= 0.0f ? 1.0f : -1.0f;
+}
+
+static bool point_in_axis_aligned_leg_sector(const Eigen::Vector2f& rel,
+    const Eigen::Vector2f& start_dir,
+    float sweep_sign,
+    float sweep_angle_rad,
+    float near_margin,
+    float range_extension)
+{
+    const float rel_norm = rel.norm();
+    if (rel_norm <= near_margin) return true;
+    if (rel_norm > range_extension) return false;
+    if (rel.dot(start_dir) < -near_margin) return false;
+
+    const float signed_angle = std::atan2(cross_2d(start_dir, rel), start_dir.dot(rel));
+    if (sweep_sign >= 0.0f)
+        return signed_angle >= 0.0f && signed_angle <= sweep_angle_rad;
+    return signed_angle <= 0.0f && signed_angle >= -sweep_angle_rad;
 }
 
 /** 主雷达系下底部离群点 CropBox；用于裁掉机器人腹部/底盘附近的自点或反射离群点 */
@@ -490,6 +559,12 @@ static bool filter_rear_legs_capsule_tf(const PointCloudXYZI::Ptr& input_fixed,
     Eigen::Vector3f a_w[kNumRearLegCapsules];
     Eigen::Vector3f b_w[kNumRearLegCapsules];
     float r2[kNumRearLegCapsules];
+    Eigen::Vector3f foot_apex[kNumLegFeet];
+    Eigen::Vector2f foot_start_dir[kNumLegFeet];
+    float foot_sweep_sign[kNumLegFeet];
+    float sector_z_min[kNumLegFeet];
+    float sector_z_max[kNumLegFeet];
+    bool foot_sector_valid[kNumLegFeet] = {false};
 
     const rclcpp::Time rtime(static_cast<int64_t>(header_stamp_sec * 1e9));
     const tf2::TimePoint tp_try = tf2_ros::fromRclcpp(rtime);
@@ -511,6 +586,23 @@ static bool filter_rear_legs_capsule_tf(const PointCloudXYZI::Ptr& input_fixed,
             b_w[i] = bd.cast<float>();
             r2[i] = sp.radius * sp.radius;
         }
+        if (g_leg_filter_sector_en) {
+            for (size_t i = 0; i < kNumLegFeet; ++i) {
+                geometry_msgs::msg::TransformStamped st;
+                try {
+                    st = g_leg_tf_buffer->lookupTransform(g_leg_filter_target_frame, g_leg_foot_frames[i], tp_try);
+                } catch (const tf2::TransformException&) {
+                    st = g_leg_tf_buffer->lookupTransform(g_leg_filter_target_frame, g_leg_foot_frames[i], tf2::TimePointZero);
+                }
+                const Eigen::Isometry3d Te = tf2::transformToEigen(st.transform);
+                foot_apex[i] = Te.translation().cast<float>() + g_leg_sector_offsets[i];
+                foot_start_dir[i] = leg_sector_start_dir_from_apex(foot_apex[i]);
+                foot_sweep_sign[i] = leg_sector_sweep_sign_from_apex(foot_apex[i]);
+                sector_z_min[i] = foot_apex[i].z() - g_leg_sector_z_margin_down;
+                sector_z_max[i] = foot_apex[i].z() + g_leg_sector_z_margin_up;
+                foot_sector_valid[i] = true;
+            }
+        }
     } catch (const tf2::TransformException& ex) {
         if (g_leg_log_clock) {
             RCLCPP_WARN_THROTTLE(
@@ -530,8 +622,28 @@ static bool filter_rear_legs_capsule_tf(const PointCloudXYZI::Ptr& input_fixed,
     for (const auto& pt : input_fixed->points) {
         const Eigen::Vector3f p(pt.x, pt.y, pt.z);
         bool inside = false;
+        bool inside_sector = false;
+        if (g_leg_filter_sector_en) {
+            for (size_t j = 0; j < kNumLegFeet; ++j) {
+                if (!foot_sector_valid[j]) continue;
+                const Eigen::Vector2f rel = p.head<2>() - foot_apex[j].head<2>();
+                if (p.z() < sector_z_min[j] || p.z() > sector_z_max[j]) continue;
+                if (point_in_axis_aligned_leg_sector(
+                        rel,
+                        foot_start_dir[j],
+                        foot_sweep_sign[j],
+                        g_leg_sector_angle_margin_rad,
+                        g_leg_sector_near_margin,
+                        g_leg_sector_range_extension)) {
+                    inside_sector = true;
+                    break;
+                }
+            }
+        }
         for (size_t i = 0; i < kNumRearLegCapsules; ++i) {
-            if (dist_sq_point_segment(p, a_w[i], b_w[i]) <= r2[i]) {
+            const bool inside_capsule = g_leg_filter_capsule_en &&
+                (dist_sq_point_segment(p, a_w[i], b_w[i]) <= r2[i]);
+            if (inside_capsule || inside_sector) {
                 inside = true;
                 break;
             }
@@ -554,7 +666,8 @@ static bool filter_rear_legs_capsule_tf(const PointCloudXYZI::Ptr& input_fixed,
         if (++_dbg_caps % 50 == 0) {
             const size_t in_sz = input_fixed->size(), out_sz = output->size();
             RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
-                "[filter_rear_legs] capsule TF in=%zu out=%zu removed=%zu",
+                "[filter_rear_legs] tf geometry(capsule=%d sector=%d) in=%zu out=%zu removed=%zu",
+                static_cast<int>(g_leg_filter_capsule_en), static_cast<int>(g_leg_filter_sector_en),
                 in_sz, out_sz, in_sz > out_sz ? in_sz - out_sz : 0);
         }
     }
@@ -678,7 +791,7 @@ void filter_rear_legs_lidar1(const PointCloudXYZI::Ptr& input,
     if (removed_out) removed_out->clear();
 
     PointCloudXYZI::Ptr working(new PointCloudXYZI());
-    if (g_leg_filter_capsule_en &&
+    if ((g_leg_filter_capsule_en || g_leg_filter_sector_en) &&
         filter_rear_legs_capsule_tf(input_fixed, working, removed_out, header_stamp_sec)) {
         // pass
     } else if (g_leg_filter_crop_fallback) {
@@ -1678,11 +1791,27 @@ public:
         /** 打印辅帧与主帧 lidar_end_time 之时间差的日志节流周期（毫秒）；0 关闭 */
         this->declare_parameter<int>("multi.aux_sync_time_log_ms", 1000);
         this->declare_parameter<bool>("multi.leg_filter_capsule_en", true);
+        this->declare_parameter<bool>("multi.leg_filter_sector_en", false);
+        this->declare_parameter<bool>("multi.leg_sector_marker_en", false);
         this->declare_parameter<bool>("multi.leg_filter_crop_fallback", true);
         this->declare_parameter<string>("multi.leg_filter_target_frame", "lidar_link");
+        this->declare_parameter<string>("multi.leg_sector_marker_frame", "lidar_link");
         this->declare_parameter<bool>("multi.filter.leg_capsule_en", true);
+        this->declare_parameter<bool>("multi.filter.leg_sector_en", false);
+        this->declare_parameter<bool>("multi.filter.leg_sector_marker_en", false);
         this->declare_parameter<bool>("multi.filter.leg_crop_fallback", true);
         this->declare_parameter<string>("multi.filter.leg_target_frame", "lidar_link");
+        this->declare_parameter<string>("multi.filter.leg_sector_marker_frame", "lidar_link");
+        this->declare_parameter<double>("multi.leg_filter_sector_angle_margin_deg", 4.0);
+        this->declare_parameter<double>("multi.leg_filter_sector_range_extension", 1.0);
+        this->declare_parameter<double>("multi.leg_filter_sector_near_margin", 0.03);
+        this->declare_parameter<double>("multi.leg_filter_sector_z_margin_up", 0.10);
+        this->declare_parameter<double>("multi.leg_filter_sector_z_margin_down", 0.40);
+        this->declare_parameter<double>("multi.filter.leg_sector_angle_margin_deg", 4.0);
+        this->declare_parameter<double>("multi.filter.leg_sector_range_extension", 1.0);
+        this->declare_parameter<double>("multi.filter.leg_sector_near_margin", 0.03);
+        this->declare_parameter<double>("multi.filter.leg_sector_z_margin_up", 0.10);
+        this->declare_parameter<double>("multi.filter.leg_sector_z_margin_down", 0.40);
         this->declare_parameter<bool>("multi.filter.bottom_crop_en", false);
         this->declare_parameter<vector<double>>("multi.filter.bottom_crop_min", vector<double>{-0.35, -0.25, -0.45});
         this->declare_parameter<vector<double>>("multi.filter.bottom_crop_max", vector<double>{ 0.35,  0.25, -0.10});
@@ -1734,6 +1863,14 @@ public:
         this->declare_parameter<vector<double>>("multi.filter.leg_capsule_offset_rl_calf", vector<double>{0.0, 0.0, 0.0});
         this->declare_parameter<vector<double>>("multi.filter.leg_capsule_offset_rr_thigh", vector<double>{0.0, 0.0, 0.0});
         this->declare_parameter<vector<double>>("multi.filter.leg_capsule_offset_rr_calf", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.leg_filter_sector_offset_fl_foot", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.leg_filter_sector_offset_fr_foot", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.leg_filter_sector_offset_rl_foot", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.leg_filter_sector_offset_rr_foot", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.filter.leg_sector_offset_fl_foot", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.filter.leg_sector_offset_fr_foot", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.filter.leg_sector_offset_rl_foot", vector<double>{0.0, 0.0, 0.0});
+        this->declare_parameter<vector<double>>("multi.filter.leg_sector_offset_rr_foot", vector<double>{0.0, 0.0, 0.0});
         this->declare_parameter<string>("tf.base_to_camera_init.parent_frame", "base");
         this->declare_parameter<string>("tf.base_to_camera_init.child_frame", "camera_init");
         this->declare_parameter<double>("tf.base_to_camera_init.tx", 0.482);
@@ -1769,11 +1906,47 @@ public:
         this->get_parameter_or<int>("multi.aux_buffer_max_size", aux_buffer_max_size, 32);
         this->get_parameter_or<int>("multi.aux_sync_time_log_ms", aux_sync_time_log_ms, 1000);
         this->get_parameter_or<bool>("multi.leg_filter_capsule_en", g_leg_filter_capsule_en, true);
+        this->get_parameter_or<bool>("multi.leg_filter_sector_en", g_leg_filter_sector_en, false);
+        this->get_parameter_or<bool>("multi.leg_sector_marker_en", g_leg_sector_marker_en, false);
         this->get_parameter_or<bool>("multi.leg_filter_crop_fallback", g_leg_filter_crop_fallback, true);
         this->get_parameter_or<string>("multi.leg_filter_target_frame", g_leg_filter_target_frame, "lidar_link");
+        this->get_parameter_or<string>("multi.leg_sector_marker_frame", g_leg_sector_marker_frame, "lidar_link");
         this->get_parameter_or<bool>("multi.filter.leg_capsule_en", g_leg_filter_capsule_en, g_leg_filter_capsule_en);
+        this->get_parameter_or<bool>("multi.filter.leg_sector_en", g_leg_filter_sector_en, g_leg_filter_sector_en);
+        this->get_parameter_or<bool>("multi.filter.leg_sector_marker_en", g_leg_sector_marker_en, g_leg_sector_marker_en);
         this->get_parameter_or<bool>("multi.filter.leg_crop_fallback", g_leg_filter_crop_fallback, g_leg_filter_crop_fallback);
         this->get_parameter_or<string>("multi.filter.leg_target_frame", g_leg_filter_target_frame, g_leg_filter_target_frame);
+        this->get_parameter_or<string>("multi.filter.leg_sector_marker_frame", g_leg_sector_marker_frame, g_leg_sector_marker_frame);
+        double leg_sector_angle_margin_deg = 4.0;
+        double leg_sector_range_extension = 1.0;
+        double leg_sector_near_margin = 0.03;
+        double leg_sector_z_margin_up = 0.10;
+        double leg_sector_z_margin_down = 0.40;
+        this->get_parameter_or<double>("multi.leg_filter_sector_angle_margin_deg",
+            leg_sector_angle_margin_deg, leg_sector_angle_margin_deg);
+        this->get_parameter_or<double>("multi.leg_filter_sector_range_extension",
+            leg_sector_range_extension, leg_sector_range_extension);
+        this->get_parameter_or<double>("multi.leg_filter_sector_near_margin",
+            leg_sector_near_margin, leg_sector_near_margin);
+        this->get_parameter_or<double>("multi.leg_filter_sector_z_margin_up",
+            leg_sector_z_margin_up, leg_sector_z_margin_up);
+        this->get_parameter_or<double>("multi.leg_filter_sector_z_margin_down",
+            leg_sector_z_margin_down, leg_sector_z_margin_down);
+        this->get_parameter_or<double>("multi.filter.leg_sector_angle_margin_deg",
+            leg_sector_angle_margin_deg, leg_sector_angle_margin_deg);
+        this->get_parameter_or<double>("multi.filter.leg_sector_range_extension",
+            leg_sector_range_extension, leg_sector_range_extension);
+        this->get_parameter_or<double>("multi.filter.leg_sector_near_margin",
+            leg_sector_near_margin, leg_sector_near_margin);
+        this->get_parameter_or<double>("multi.filter.leg_sector_z_margin_up",
+            leg_sector_z_margin_up, leg_sector_z_margin_up);
+        this->get_parameter_or<double>("multi.filter.leg_sector_z_margin_down",
+            leg_sector_z_margin_down, leg_sector_z_margin_down);
+        g_leg_sector_angle_margin_rad = static_cast<float>(std::max(0.0, leg_sector_angle_margin_deg) * M_PI / 180.0);
+        g_leg_sector_range_extension = static_cast<float>(std::max(0.0, leg_sector_range_extension));
+        g_leg_sector_near_margin = static_cast<float>(std::max(0.0, leg_sector_near_margin));
+        g_leg_sector_z_margin_up = static_cast<float>(std::max(0.0, leg_sector_z_margin_up));
+        g_leg_sector_z_margin_down = static_cast<float>(std::max(0.0, leg_sector_z_margin_down));
         vector<double> bottom_crop_min{-0.35, -0.25, -0.45};
         vector<double> bottom_crop_max{ 0.35,  0.25, -0.10};
         this->get_parameter_or<bool>("multi.filter.bottom_crop_en", g_bottom_filter_crop_en, false);
@@ -1798,6 +1971,10 @@ public:
         vector<double> leg_capsule_offset_rl_calf{0.0, 0.0, 0.0};
         vector<double> leg_capsule_offset_rr_thigh{0.0, 0.0, 0.0};
         vector<double> leg_capsule_offset_rr_calf{0.0, 0.0, 0.0};
+        vector<double> leg_sector_offset_fl_foot{0.0, 0.0, 0.0};
+        vector<double> leg_sector_offset_fr_foot{0.0, 0.0, 0.0};
+        vector<double> leg_sector_offset_rl_foot{0.0, 0.0, 0.0};
+        vector<double> leg_sector_offset_rr_foot{0.0, 0.0, 0.0};
         this->get_parameter_or<double>("multi.leg_filter_capsule_diameter_fl_thigh",
             leg_capsule_diameter_fl_thigh, leg_capsule_diameter_fl_thigh);
         this->get_parameter_or<double>("multi.leg_filter_capsule_diameter_fl_calf",
@@ -1862,6 +2039,22 @@ public:
             leg_capsule_offset_rr_thigh, leg_capsule_offset_rr_thigh);
         this->get_parameter_or<vector<double>>("multi.filter.leg_capsule_offset_rr_calf",
             leg_capsule_offset_rr_calf, leg_capsule_offset_rr_calf);
+        this->get_parameter_or<vector<double>>("multi.leg_filter_sector_offset_fl_foot",
+            leg_sector_offset_fl_foot, vector<double>{0.0, 0.0, 0.0});
+        this->get_parameter_or<vector<double>>("multi.leg_filter_sector_offset_fr_foot",
+            leg_sector_offset_fr_foot, vector<double>{0.0, 0.0, 0.0});
+        this->get_parameter_or<vector<double>>("multi.leg_filter_sector_offset_rl_foot",
+            leg_sector_offset_rl_foot, vector<double>{0.0, 0.0, 0.0});
+        this->get_parameter_or<vector<double>>("multi.leg_filter_sector_offset_rr_foot",
+            leg_sector_offset_rr_foot, vector<double>{0.0, 0.0, 0.0});
+        this->get_parameter_or<vector<double>>("multi.filter.leg_sector_offset_fl_foot",
+            leg_sector_offset_fl_foot, leg_sector_offset_fl_foot);
+        this->get_parameter_or<vector<double>>("multi.filter.leg_sector_offset_fr_foot",
+            leg_sector_offset_fr_foot, leg_sector_offset_fr_foot);
+        this->get_parameter_or<vector<double>>("multi.filter.leg_sector_offset_rl_foot",
+            leg_sector_offset_rl_foot, leg_sector_offset_rl_foot);
+        this->get_parameter_or<vector<double>>("multi.filter.leg_sector_offset_rr_foot",
+            leg_sector_offset_rr_foot, leg_sector_offset_rr_foot);
         set_leg_capsule_diameter("FL_thigh", leg_capsule_diameter_fl_thigh);
         set_leg_capsule_diameter("FL_calf", leg_capsule_diameter_fl_calf);
         set_leg_capsule_diameter("FR_thigh", leg_capsule_diameter_fr_thigh);
@@ -1878,6 +2071,10 @@ public:
         set_leg_capsule_offset("RL_calf", leg_capsule_offset_rl_calf);
         set_leg_capsule_offset("RR_thigh", leg_capsule_offset_rr_thigh);
         set_leg_capsule_offset("RR_calf", leg_capsule_offset_rr_calf);
+        set_leg_sector_offset("FL_foot", leg_sector_offset_fl_foot);
+        set_leg_sector_offset("FR_foot", leg_sector_offset_fr_foot);
+        set_leg_sector_offset("RL_foot", leg_sector_offset_rl_foot);
+        set_leg_sector_offset("RR_foot", leg_sector_offset_rr_foot);
         std::string tf_base_parent_frame = "base";
         std::string tf_base_child_frame = "camera_init";
         this->get_parameter_or<string>("tf.base_to_camera_init.parent_frame", tf_base_parent_frame, "base");
@@ -2036,6 +2233,13 @@ public:
             RCLCPP_INFO(this->get_logger(), "%sfilter_size_surf_min%s: %s%.3f%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, filter_size_surf_min, COLOR_RESET);
             RCLCPP_INFO(this->get_logger(), "%sfilter_size_map_min%s: %s%.3f%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, filter_size_map_min, COLOR_RESET);
             RCLCPP_INFO(this->get_logger(), "%sfilter_size_aux_voxel[0/1]%s: %s%.4f / %.4f (0=off)%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, filter_size_aux_voxel[0], filter_size_aux_voxel[1], COLOR_RESET);
+            RCLCPP_INFO(this->get_logger(), "%sleg_capsule_en%s: %s%s%s", COLOR_ITEM, COLOR_RESET, g_leg_filter_capsule_en ? COLOR_BOOL_ON : COLOR_BOOL_OFF, g_leg_filter_capsule_en ? "true" : "false", COLOR_RESET);
+            RCLCPP_INFO(this->get_logger(), "%sleg_sector_en%s: %s%s%s", COLOR_ITEM, COLOR_RESET, g_leg_filter_sector_en ? COLOR_BOOL_ON : COLOR_BOOL_OFF, g_leg_filter_sector_en ? "true" : "false", COLOR_RESET);
+            RCLCPP_INFO(this->get_logger(), "%sleg_sector_marker_en%s: %s%s%s", COLOR_ITEM, COLOR_RESET, g_leg_sector_marker_en ? COLOR_BOOL_ON : COLOR_BOOL_OFF, g_leg_sector_marker_en ? "true" : "false", COLOR_RESET);
+            RCLCPP_INFO(this->get_logger(), "%sleg_sector_marker_frame%s: %s%s%s", COLOR_ITEM, COLOR_RESET, COLOR_STRING, g_leg_sector_marker_frame.c_str(), COLOR_RESET);
+            RCLCPP_INFO(this->get_logger(), "%sleg_sector_angle_margin_deg%s: %s%.2f%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, static_cast<double>(g_leg_sector_angle_margin_rad * 180.0 / M_PI), COLOR_RESET);
+            RCLCPP_INFO(this->get_logger(), "%sleg_sector_range_extension%s: %s%.3f%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, g_leg_sector_range_extension, COLOR_RESET);
+            RCLCPP_INFO(this->get_logger(), "%sleg_sector_near_margin%s: %s%.3f%s", COLOR_ITEM, COLOR_RESET, COLOR_NUMBER, g_leg_sector_near_margin, COLOR_RESET);
             RCLCPP_INFO(this->get_logger(), "%sbottom_crop_en%s: %s%s%s", COLOR_ITEM, COLOR_RESET, g_bottom_filter_crop_en ? COLOR_BOOL_ON : COLOR_BOOL_OFF, g_bottom_filter_crop_en ? "true" : "false", COLOR_RESET);
             RCLCPP_INFO(this->get_logger(), "%sbottom_crop_min%s: %s[%.3f, %.3f, %.3f]%s",
                 COLOR_ITEM, COLOR_RESET, COLOR_NUMBER,
@@ -2278,6 +2482,7 @@ public:
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
+        pubLegSectorMarkers_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("/leg_sector_markers", 10);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
         static_tf_broadcaster_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
         {
@@ -2465,6 +2670,7 @@ private:
                 publish_frame_body_fusion(pubLaserCloudFull_fusion_);
             if (removed_en)
                 publish_lidar2_removed(pubLaserCloudRemoved_);
+            publish_leg_sector_markers(pubLegSectorMarkers_);
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
 
             /*** Debug variables ***/
@@ -2520,11 +2726,143 @@ private:
         }
     }
 
+    void publish_leg_sector_markers(
+        rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_markers)
+    {
+        if (!pub_markers) return;
+
+        visualization_msgs::msg::MarkerArray arr;
+        visualization_msgs::msg::Marker clear;
+        clear.header.stamp = this->get_clock()->now();
+        clear.header.frame_id = g_leg_sector_marker_frame;
+        clear.ns = "leg_sector";
+        clear.id = 0;
+        clear.action = visualization_msgs::msg::Marker::DELETEALL;
+        arr.markers.push_back(clear);
+
+        if (!g_leg_sector_marker_en || !g_leg_filter_sector_en || !g_leg_tf_buffer || !g_leg_filter_tf_ready) {
+            pub_markers->publish(arr);
+            return;
+        }
+
+        const auto stamp = this->get_clock()->now();
+        const tf2::TimePoint tp_try = tf2_ros::fromRclcpp(stamp);
+        const float sweep_angle = std::max(0.0f, g_leg_sector_angle_margin_rad);
+
+        try {
+            Eigen::Isometry3f T_marker_from_filter = Eigen::Isometry3f::Identity();
+            if (g_leg_sector_marker_frame != g_leg_filter_target_frame) {
+                geometry_msgs::msg::TransformStamped st_frame;
+                try {
+                    st_frame = g_leg_tf_buffer->lookupTransform(
+                        g_leg_sector_marker_frame, g_leg_filter_target_frame, tp_try);
+                } catch (const tf2::TransformException&) {
+                    st_frame = g_leg_tf_buffer->lookupTransform(
+                        g_leg_sector_marker_frame, g_leg_filter_target_frame, tf2::TimePointZero);
+                }
+                T_marker_from_filter = tf2::transformToEigen(st_frame.transform).cast<float>();
+            }
+
+            auto make_point = [](float x, float y, float z) {
+                geometry_msgs::msg::Point p;
+                p.x = x; p.y = y; p.z = z;
+                return p;
+            };
+            auto transform_point = [&T_marker_from_filter, &make_point](const Eigen::Vector3f& p) {
+                const Eigen::Vector3f q = T_marker_from_filter * p;
+                return make_point(q.x(), q.y(), q.z());
+            };
+
+            for (size_t i = 0; i < kNumLegFeet; ++i) {
+                geometry_msgs::msg::TransformStamped st;
+                try {
+                    st = g_leg_tf_buffer->lookupTransform(g_leg_filter_target_frame, g_leg_foot_frames[i], tp_try);
+                } catch (const tf2::TransformException&) {
+                    st = g_leg_tf_buffer->lookupTransform(g_leg_filter_target_frame, g_leg_foot_frames[i], tf2::TimePointZero);
+                }
+                const Eigen::Vector3f apex = tf2::transformToEigen(st.transform).translation().cast<float>() + g_leg_sector_offsets[i];
+                const Eigen::Vector2f start_dir = leg_sector_start_dir_from_apex(apex);
+                const float sweep_sign = leg_sector_sweep_sign_from_apex(apex);
+                const Eigen::Rotation2Df rot_end(sweep_sign * sweep_angle);
+                const Eigen::Vector2f end_dir = rot_end * start_dir;
+                const Eigen::Vector2f far_start_xy = apex.head<2>() + start_dir * g_leg_sector_range_extension;
+                const Eigen::Vector2f far_end_xy = apex.head<2>() + end_dir * g_leg_sector_range_extension;
+                const float z_low = apex.z() - g_leg_sector_z_margin_down;
+                const float z_high = apex.z() + g_leg_sector_z_margin_up;
+
+                visualization_msgs::msg::Marker foot_marker;
+                foot_marker.header.stamp = stamp;
+                foot_marker.header.frame_id = g_leg_sector_marker_frame;
+                foot_marker.ns = "leg_sector_foot";
+                foot_marker.id = static_cast<int>(i);
+                foot_marker.type = visualization_msgs::msg::Marker::SPHERE;
+                foot_marker.action = visualization_msgs::msg::Marker::ADD;
+                const Eigen::Vector3f apex_marker = T_marker_from_filter * apex;
+                foot_marker.pose.position = make_point(apex_marker.x(), apex_marker.y(), apex_marker.z());
+                foot_marker.pose.orientation.w = 1.0;
+                foot_marker.scale.x = 0.05;
+                foot_marker.scale.y = 0.05;
+                foot_marker.scale.z = 0.05;
+                foot_marker.color.r = 0.1f;
+                foot_marker.color.g = 0.9f;
+                foot_marker.color.b = 0.2f;
+                foot_marker.color.a = 0.9f;
+                arr.markers.push_back(foot_marker);
+
+                visualization_msgs::msg::Marker wedge_marker;
+                wedge_marker.header.stamp = stamp;
+                wedge_marker.header.frame_id = g_leg_sector_marker_frame;
+                wedge_marker.ns = "leg_sector_wedge";
+                wedge_marker.id = static_cast<int>(100 + i);
+                wedge_marker.type = visualization_msgs::msg::Marker::LINE_LIST;
+                wedge_marker.action = visualization_msgs::msg::Marker::ADD;
+                wedge_marker.pose.orientation.w = 1.0;
+                wedge_marker.scale.x = 0.015;
+                wedge_marker.color.r = 0.1f;
+                wedge_marker.color.g = 0.8f;
+                wedge_marker.color.b = 1.0f;
+                wedge_marker.color.a = 0.95f;
+
+                const geometry_msgs::msg::Point apex_low = transform_point(Eigen::Vector3f(apex.x(), apex.y(), z_low));
+                const geometry_msgs::msg::Point apex_high = transform_point(Eigen::Vector3f(apex.x(), apex.y(), z_high));
+                const geometry_msgs::msg::Point far_start_low = transform_point(Eigen::Vector3f(far_start_xy.x(), far_start_xy.y(), z_low));
+                const geometry_msgs::msg::Point far_start_high = transform_point(Eigen::Vector3f(far_start_xy.x(), far_start_xy.y(), z_high));
+                const geometry_msgs::msg::Point far_end_low = transform_point(Eigen::Vector3f(far_end_xy.x(), far_end_xy.y(), z_low));
+                const geometry_msgs::msg::Point far_end_high = transform_point(Eigen::Vector3f(far_end_xy.x(), far_end_xy.y(), z_high));
+
+                auto add_line = [&wedge_marker](const geometry_msgs::msg::Point& p0,
+                                               const geometry_msgs::msg::Point& p1) {
+                    wedge_marker.points.push_back(p0);
+                    wedge_marker.points.push_back(p1);
+                };
+
+                add_line(apex_low, far_start_low);
+                add_line(apex_low, far_end_low);
+                add_line(far_start_low, far_end_low);
+                add_line(apex_high, far_start_high);
+                add_line(apex_high, far_end_high);
+                add_line(far_start_high, far_end_high);
+                add_line(apex_low, apex_high);
+                add_line(far_start_low, far_start_high);
+                add_line(far_end_low, far_end_high);
+                arr.markers.push_back(wedge_marker);
+            }
+        } catch (const tf2::TransformException& ex) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(), *this->get_clock(), 5000,
+                "Leg sector marker publish failed (%s): %s",
+                g_leg_sector_marker_frame.c_str(), ex.what());
+        }
+
+        pub_markers->publish(arr);
+    }
+
 private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_fusion_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudRemoved_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pubLegSectorMarkers_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
